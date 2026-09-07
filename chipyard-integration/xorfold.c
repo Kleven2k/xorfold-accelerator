@@ -1,5 +1,7 @@
 #include "rocc.h"
 
+unsigned long data = 0x1000;
+
 static inline void xorfold_reset(void)
 {
 	ROCC_INSTRUCTION(3, 0);
@@ -17,6 +19,11 @@ static inline unsigned long xorfold_read(void)
 	return value;
 }
 
+static inline void xorfold_fold_mem(unsigned long *ptr)
+{
+	ROCC_INSTRUCTION_S(3, ptr, 3);
+}
+
 int main(void)
 {
 	unsigned long result;
@@ -30,11 +37,18 @@ int main(void)
 	if (result != 10)
 		return 1;
 
+	xorfold_fold_mem(&data);
+
+	result = xorfold_read();
+
+	if (result != 0x100a)
+		return 2;
+
 	xorfold_reset();
 
 	result = xorfold_read();
 	if (result != 0)
-		return 2;
+		return 3;
 
 	return 0;
 }
