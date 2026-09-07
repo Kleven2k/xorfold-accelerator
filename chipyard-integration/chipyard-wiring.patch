@@ -1,0 +1,73 @@
+diff --git a/build.sbt b/build.sbt
+index f56621cc..b7076ec1 100644
+--- a/build.sbt
++++ b/build.sbt
+@@ -179,7 +179,7 @@ lazy val chipyard = {
+     Seq(
+       testchipip, rocketchip, boom, rocketchip_blocks, rocketchip_inclusive_cache,
+       icenet, tracegen,
+-      constellation, barf, shuttle, rerocc,
++      constellation, barf, shuttle, rerocc, xorfold,
+     ).map(sbt.Project.projectToRef) ++
+     (if (useChisel7) Seq() else Seq(sbt.Project.projectToRef(firrtl2_bridge))) ++
+     (if (useChisel7) Seq() else Seq(sbt.Project.projectToRef(dsptools), sbt.Project.projectToRef(rocket_dsp_utils)))
+@@ -314,6 +314,11 @@ lazy val shuttle = withInitCheck((project in file("generators/shuttle")), "shutt
+   .settings(libraryDependencies ++= rocketLibDeps.value)
+   .settings(commonSettings)
+ 
++lazy val xorfold = withInitCheck((project in file("generators/xorfold-accelerator")), "xorfold-accelerator")
++  .dependsOn(rocketchip)
++  .settings(libraryDependencies ++= rocketLibDeps.value)
++  .settings(commonSettings)
++
+ // Helper: fail fast if a generator project is used without its submodule initialized.
+ def withInitCheck(p: Project, genDirName: String): Project = {
+   val checkTask = Def.task {
+diff --git a/generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala b/generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala
+index 2f8f15a6..074c6836 100644
+--- a/generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala
++++ b/generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala
+@@ -15,3 +15,8 @@ class ReRoCCTestConfig extends Config(
+   new chipyard.config.WithAccumulatorRoCC ++                   // rerocc tile0 is accum
+   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+   new chipyard.config.AbstractConfig)
++  
++class XorFoldRoCCConfig extends Config(
++  new chipyard.config.WithXorFoldRoCC ++
++  new freechips.rocketchip.rocket.WithNBigCores(1) ++
++  new chipyard.config.AbstractConfig)
+diff --git a/generators/chipyard/src/main/scala/config/fragments/RoCCFragments.scala b/generators/chipyard/src/main/scala/config/fragments/RoCCFragments.scala
+index 01064fcd..510e9898 100644
+--- a/generators/chipyard/src/main/scala/config/fragments/RoCCFragments.scala
++++ b/generators/chipyard/src/main/scala/config/fragments/RoCCFragments.scala
+@@ -45,3 +45,10 @@ class WithCharacterCountRoCC(op: OpcodeSet = OpcodeSet.custom2) extends Config((
+     counter
+   })
+ })
++
++class WithXorFoldRoCC(op: OpcodeSet = OpcodeSet.custom3) extends Config((site, here, up) => {
++  case BuildRoCC => up(BuildRoCC) ++ Seq((p: Parameters) => {
++    val accel = LazyModule(new xorfold.XorFoldAccelerator(op)(p))
++    accel
++  })
++})
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 27b2d7e1..2373f89c 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -70,6 +70,7 @@ add_link_options(-T ${LINKER_SCRIPT})
+ add_executable(pwm pwm.c)
+ add_executable(blkdev blkdev.c)
+ add_executable(accum accum.c)
++add_executable(xorfold xorfold.c)
+ add_executable(charcount charcount.c)
+ add_executable(cpp-hello cpp-hello.cpp)
+ add_executable(nic-loopback nic-loopback.c)
+@@ -111,6 +112,7 @@ endfunction()
+ add_dump_target(pwm)
+ add_dump_target(blkdev)
+ add_dump_target(accum)
++add_dump_target(xorfold)
+ add_dump_target(charcount)
+ add_dump_target(cpp-hello)
+ add_dump_target(nic-loopback)
