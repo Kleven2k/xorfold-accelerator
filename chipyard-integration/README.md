@@ -21,9 +21,19 @@ from a fresh chipyard checkout without needing a maintained chipyard fork.
     (single Rocket core + the accelerator)
   - `tests/CMakeLists.txt` — adds the `xorfold` / `xorfold-dump` build targets
 - `xorfold.c` — the baremetal RoCC test (not part of the patch since it's a new file;
-  copy it in directly). Exercises funct=0 (reset), funct=1 (fold), funct=2 (read) via
-  `tests/rocc.h`'s `ROCC_INSTRUCTION*` macros. See this repo's `CONTEXT.md` for the
-  verified test sequence and pass/fail behavior.
+  copy it in directly). Exercises funct=0 (reset), funct=1 (fold), funct=2 (read), and
+  funct=3 (fold-from-memory via `io.mem`) via `tests/rocc.h`'s `ROCC_INSTRUCTION*`
+  macros. See this repo's `CONTEXT.md` for the verified test sequence and pass/fail
+  behavior.
+
+**Important — these two files are versioned together with the accelerator submodule
+commit, not independently.** `xorfold.c`'s funct=3 test only passes against an
+accelerator checkout that actually has the `io.mem` logic (commit `28613a6` or later).
+If you pin `generators/xorfold-accelerator` to an older commit (e.g. `b698a25`, funct=0/1/2
+only) but use the current `xorfold.c`, the funct=3 check will fail — not because
+anything is broken, but because the hardware and test have drifted apart. When applying
+this integration, make sure the submodule commit and the copied `xorfold.c` come from
+the same point in this repo's history (in practice: just use the `HEAD` of both).
 
 ## Applying to a fresh Chipyard checkout
 
@@ -61,11 +71,15 @@ cd ../sims/verilator
 
 If `XorFoldAccelerator.scala` changes in a way that needs new chipyard-side config
 (e.g. new funct codes, memory-access support requiring `io.mem` wiring changes to
-`RoCCFragments.scala`), regenerate the patch from the chipyard clone:
+`RoCCFragments.scala`), regenerate the patch from the chipyard clone. Use `git diff
+HEAD` (not plain `git diff`) — the `.gitmodules` submodule registration is staged
+rather than a plain working-tree edit, so a plain `git diff` silently omits it and
+produces a patch that fails to add the submodule on a fresh apply (this happened once
+already — see git history on this file):
 
 ```bash
 cd ~/projects/chipyard
-git diff .gitmodules build.sbt \
+git diff HEAD -- .gitmodules build.sbt \
   generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala \
   generators/chipyard/src/main/scala/config/fragments/RoCCFragments.scala \
   tests/CMakeLists.txt \
