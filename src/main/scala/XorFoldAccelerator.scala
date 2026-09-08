@@ -337,18 +337,14 @@ class XorFoldAcceleratorModuleImp(
       memWriteData, 
       0.U
     )
+  
+  io.mem.req.bits.mask := 
+    Fill(xLen / 8, 1.U(1.W))
 
-  io.mem.req.bits.phys := 
-    false.B 
-  
-  io.mem.req.bits.dprv := 
-    memDprv
-  
-  io.mem.req.bits.dv := 
-    memDv 
-  
-  io.mem.req.bits.no_resp := 
-    false.B 
+  io.mem.req.bits.phys    := false.B 
+  io.mem.req.bits.dprv    := memDprv
+  io.mem.req.bits.dv      := memDv 
+  io.mem.req.bits.no_resp := false.B 
 
   /* 
    * ------------------------------------------------------------
