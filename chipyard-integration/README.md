@@ -67,6 +67,35 @@ cd ../sims/verilator
 # exit code 0 == pass
 ```
 
+## Updating xorfold.c after editing the test
+
+`chipyard/tests/xorfold.c` is the real, live test file — it's what actually gets
+compiled and run. `xorfold.c` in this directory is a **plain copy**, not a symlink and
+not tracked by any build tooling, kept here so this repo has a self-contained record
+of the test that verified each hardware milestone. Editing the copy in this repo does
+nothing; it won't get compiled, run, or fed back into chipyard.
+
+Workflow whenever you change and verify something in `chipyard/tests/xorfold.c`:
+
+```bash
+# 1. Edit chipyard/tests/xorfold.c, then build + run it there to confirm it passes:
+cd ~/projects/chipyard/tests
+cmake --build build --target xorfold
+cd ../sims/verilator
+./simulator-chipyard.harness-XorFoldRoCCConfig ../../tests/build/xorfold.riscv
+# exit code 0 == pass
+
+# 2. Once it passes, copy it into this repo and commit:
+cp ~/projects/chipyard/tests/xorfold.c ~/projects/xorfold-accelerator/chipyard-integration/xorfold.c
+cd ~/projects/xorfold-accelerator
+git add chipyard-integration/xorfold.c
+git commit -m "..."
+git push
+```
+
+Skipping step 2 just means this repo's copy silently goes stale relative to the real
+test — not a build break, just a drift worth avoiding.
+
 ## Regenerating this patch after further changes
 
 If `XorFoldAccelerator.scala` changes in a way that needs new chipyard-side config
