@@ -25,15 +25,15 @@ class XorFoldAcceleratorModuleImp(
   /* 
    * This implementation currently assumes RV64:
    *  
-   *  - memory operations are 8 bytes
-   *  - checksum streaming processes one 64-bit beat at a time
-   *  - each beat contains four RFC 1071 16-bit words
+   *   - memory operations are 8 bytes
+   *   - checksum streaming processes one 64-bit beat at a time
+   *   - each beat contains four RFC 1071 16-bit words
    */
   require(xLen == 64, "XorFoldAccelerator currently requires RV64")
 
   /*
    * ------------------------------------------------------------
-   * Accumulator
+   * Accumulators
    * ------------------------------------------------------------
    */
 
@@ -43,11 +43,19 @@ class XorFoldAcceleratorModuleImp(
   val accum = RegInit(0.U(xLen.W))
 
   /* 
-   * Independent one's-complement checksum accumulator.
-   *  
-   * Keeping this seperate from accum prevents XOR operations and
-   * RFC checksum operations from implicitly changing each other's
-   * state.
+   * RFC 1071 checksum accumulator.
+   * 
+   * Invariant:
+   * 
+   *   checksumAccum(15, 0)
+   * 
+   * always contains the current 16-bit one's-complement running
+   * sum.
+   * 
+   * Bits [63:16] are always zero.
+   * 
+   * This scalar representation makes RFC 1624 incremental updates
+   * direct and unambiguous.  
    */
   val checksumAccum = RegInit(0.U(xLen.W))
 
@@ -83,13 +91,13 @@ class XorFoldAcceleratorModuleImp(
    * ------------------------------------------------------------
    *  
    * memXorFold:
-   *  Load data and XOR it into accum.
+   *   Load data and XOR it into accum.
    *  
    * memChecksum:
-   *  Load data and one's-complement-add it into checksumAccum.
+   *   Load data and one's-complement-add it into checksumAccum.
    *  
    * memWriteResult: 
-   *  Store memWriteData to memory.
+   *   Store memWriteData to memory.
    */
 
   val memXorFold :: memChecksum :: memWriteResult :: Nil = Enum(3)
@@ -103,10 +111,10 @@ class XorFoldAcceleratorModuleImp(
    *  Waiting for a RoCC command.
    * 
    * sMemReq:
-   *  Present memory request until accepted.
+   *   Present memory request until accepted.
    *  
    * sMemResp: 
-   *  Wait for completion/response. 
+   *   Wait for completion/response. 
    */
   val sIdle :: sMemReq :: sMemResp :: Nil = Enum(3)
   val state = RegInit(sIdle)
@@ -123,14 +131,16 @@ class XorFoldAcceleratorModuleImp(
 
   val doReset            = funct === 0.U
   val doFold             = funct === 1.U
+
   // funct=2 is the ordinary accum read via the generic response path.
+  
   val doFoldMem          = funct === 3.U
   val doFoldMemN         = funct === 4.U
   val doWriteResult      = funct === 5.U 
-
   val doChecksumReset    = funct === 6.U 
   val doChecksumAddN     = funct === 7.U 
   val doChecksumFinalize = funct === 8.U 
+  val doChecksumUpdate   = funct === 9.U
 
   /* 
    * ------------------------------------------------------------
@@ -158,67 +168,61 @@ class XorFoldAcceleratorModuleImp(
     memWriteData := writeData
     memDprv      := dprv 
     memDv        := dv 
-
-    state := sMemReq  
+    state        := sMemReq  
   }
 
   /* 
    * ------------------------------------------------------------
-   * Helper: one's-complement addition
+   * Helper: 16-bit one's-complement addition
    * ------------------------------------------------------------
    *  
-   * Add two 64-bit values while preserving the carry-out bit.
-   *  
-   * +& produces a 65-bit result:
-   *  
-   *    [64]   = carry
-   *    [63:0] = low result
-   *  
-   * The carry is then wrapped back into bit 0
-   *  
-   * A second carry fold is not required here. The maximum sum of 
-   * two 64-bit inputs is:
+   * RFC 1071 and RFC 1624 use one's-complement arithmetic.
    * 
-   *    (2^64 - 1) + (2^64 - 1) = 2^65 - 2
-   *  
-   * so the impossible problematic pattern 1_FFFF...FFFF can never
-   * result from one two-operand addition.   
+   * +& preserves the carry-out:
+   *
+   *   [16]   = carry
+   *   [15:0] = low result
+   * 
+   * The carry is then wrapped back into bit 0.  
    */
 
-  def onesComplementAdd64(a: UInt, b: UInt): UInt = {
-    val wideSum = a +& b 
-
+  def onesComplementAdd16(a: UInt, b: UInt): UInt = {
+    
+    val wideSum =
+      a(15, 0) +& b(15, 0)
+    
     val folded =
-      wideSum(63, 0) +& wideSum(64)
+      wideSum(15, 0) +& wideSum(16)
 
-    folded(63, 0)
+    folded(15, 0)
   }
 
   /* 
    * ------------------------------------------------------------
-   * Helper: convert a little-endian RV64 load into four
-   * network-order 16-bit checksum words.
+   * Helper: convert a little-endian RV64 memory beat into four
+   * network-order 16-bit words
    * ------------------------------------------------------------
    *  
-   * Example bytes in increasing memory addresses:
+   * Example memory bytes:
    * 
-   *  00 01  00 02  00 03  00 04
+   *   00 01  00 02  00 03  00 04
    * 
    * RV64 load value: 
    *
-   *  0x0400030002000100
+   *   0x0400030002000100
    * 
    * RFC 1071 needs the 16-bit values:
    *
-   *  0x0001
-   *  0x0002
-   *  0x0003
-   *  0x0004
+   *   0x0001
+   *   0x0002
+   *   0x0003
+   *   0x0004
    * 
    * Therefore swap the two bytes within every 16-bit lane.
    */
 
   def networkOrder16Lanes(d: UInt): UInt = {
+
     Cat(
       d(55, 48), d(63, 56),
       d(39, 32), d(47, 40),
@@ -229,59 +233,69 @@ class XorFoldAcceleratorModuleImp(
 
   /* 
    * ------------------------------------------------------------
+   * Helper: fold four 16-bit words into one RFC 1071 sum
+   * ------------------------------------------------------------
+   * 
+   * Input:
+   *   [63:48] = word3
+   *   [47:32] = word2
+   *   [31:16] = word1
+   *   [15:0]  = word0
+   * 
+   * Output:
+   *   
+   *   one 16-bit one's-complement sum. 
+   */
+  def fold64To16(x: UInt): UInt = {
+    
+    val chunk0 = x(15, 0)
+    val chunk1 = x(31, 16)
+    val chunk2 = x(47, 32)
+    val chunk3 = x(63, 48)
+
+    /* 
+    * Maximum:
+    *
+    *   4 * 0xffff = 0x3fffc
+    * 
+    * so 18 bits are sufficient.
+    */
+    val chunkSum =
+      chunk0.pad(18) +
+      chunk1.pad(18) +
+      chunk2.pad(18) +
+      chunk3.pad(18)
+
+    /* 
+    * First end-around carry fold.
+    * 
+    * Add bits [17:16] back into the low 16 bits.
+    */
+    val fold1 =
+      chunkSum(15, 0).pad(17) +
+      chunkSum(17, 16).pad(17)
+    
+    /* 
+    * A second fold handles a possible carry from fold1.
+    */
+    val fold2 =
+      fold1(15, 0) +&
+      fold1(16)
+
+    fold2(15, 0)
+  }
+
+  /* 
+   * ------------------------------------------------------------
    * RFC 1071 finalization
    * ------------------------------------------------------------
    * 
-   * checksumAccum contains four 16-bit lanes:
+   * checksumAccum is already maintained as a scalar 16-bit sum.
    * 
-   *   [63:48]
-   *   [47:32]
-   *   [31:16]
-   *   [15:0]
-   * 
-   * Add all four lanes, fold any carry back into the low 16 bits,
-   * then take the one's complement.
-   */
-
-  val checksumChunk0 = checksumAccum(15, 0)
-  val checksumChunk1 = checksumAccum(31, 16)
-  val checksumChunk2 = checksumAccum(47, 32)
-  val checksumChunk3 = checksumAccum(63, 48)
-
-  /* 
-   * Four maximum 16-bit values sum to:
-   * 
-   *   4 * 0xffff = 0x3fffc
-   * 
-   * which fits in 18 bits.
-   */
-  val checksumChunkSum =
-    checksumChunk0.pad(18) +
-    checksumChunk1.pad(18) +
-    checksumChunk2.pad(18) +
-    checksumChunk3.pad(18)
-
-  /* 
-   * First end-around fold:
-   *
-   * upper two carry bits are added into the low 16 bits.
-   */
-  val checksumFold1 =
-    checksumChunkSum(15, 0).pad(17) +
-    checksumChunkSum(17, 16).pad(17)
-
-  /* 
-   * Second fold handles a possible carry from checksumFold1.
-   */
-  val checksumFold2 =
-    checksumFold1(15, 0) +&
-    checksumFold1(16)
-
-  /* 
-   * RFC 1071 final checksum.
+   * Therefore finalization is simply the one's complement.
    */
   val checksumFinal =
-    ~checksumFold2(15, 0)
+    ~checksumAccum(15, 0)
 
   /*
    * ------------------------------------------------------------
@@ -289,7 +303,8 @@ class XorFoldAcceleratorModuleImp(
    * ------------------------------------------------------------
    */
 
-  val idle = state === sIdle 
+  val idle = 
+    state === sIdle 
 
   /* 
    * xd means the instruction expects a response through io.resp.
@@ -297,9 +312,11 @@ class XorFoldAcceleratorModuleImp(
    * If the response interface cannot accept it, don't consume
    * the command yet.
    */
-  val doResp = cmd.bits.inst.xd 
+  val doResp = 
+    cmd.bits.inst.xd 
 
-  val stallResp = doResp && !io.resp.ready 
+  val stallResp = 
+    doResp && !io.resp.ready 
 
   /* 
    * While the memory FSM is active, no subsequent RoCC command
@@ -307,13 +324,14 @@ class XorFoldAcceleratorModuleImp(
    *  
    * This is what serializes:
    * 
-   *    fold_mem_n(...)
-   *    xorfold_read()
+   *   fold_mem_n(...)
+   *   xorfold_read()
    *  
    * The read cannot fire until the final memory response has been
    * processed and state returns to sIdle.
    */
-  cmd.ready := idle && !stallResp
+  cmd.ready := 
+    idle && !stallResp
 
   /*
    * funct = 0
@@ -346,6 +364,7 @@ class XorFoldAcceleratorModuleImp(
    * One-word XOR memory fold.
    */
   when (cmd.fire && doFoldMem) {
+
     startMemOp(
       addr      = cmd.bits.rs1,
       count     = 1.U,
@@ -367,6 +386,7 @@ class XorFoldAcceleratorModuleImp(
    * n == 0 is a no-op.
    */
   when (cmd.fire && doFoldMemN) {
+
     when (cmd.bits.rs2 =/= 0.U) {
       startMemOp(
         addr      = cmd.bits.rs1,
@@ -392,6 +412,7 @@ class XorFoldAcceleratorModuleImp(
    * store transaction is independent of cmd.bits afterward.
    */
   when (cmd.fire && doWriteResult) {
+
     startMemOp(
       addr      = cmd.bits.rs1,
       count     = 1.U,
@@ -413,6 +434,7 @@ class XorFoldAcceleratorModuleImp(
    */
 
   when (cmd.fire && doChecksumReset) {
+
     checksumAccum := 0.U
   }
 
@@ -431,6 +453,7 @@ class XorFoldAcceleratorModuleImp(
    */
 
   when (cmd.fire && doChecksumAddN) {
+
     when (cmd.bits.rs2 =/= 0.U) {
       startMemOp(
         addr      = cmd.bits.rs1,
@@ -456,26 +479,97 @@ class XorFoldAcceleratorModuleImp(
    * checksumAccum itself is not modified.
    */
 
-  /*
-   * ------------------------------------------------------------
-   * CPU response
-   * ------------------------------------------------------------
-   *
-   * funct=2:
-   *   return accum
+  /* 
+   * funct = 9
    * 
-   * funct=8:
-   *   return the finalized 16-bit Internet checksum, zero-extended
-   *   ti xLen.
+   * checksum_update(oldWord, newWord)
    * 
-   * read()
+   * RFC 1624 incremental checksum update.
+   * 
+   * rs1[15:0] = old 16-bit network-order word
+   * rs2[15:0] = new 16-bit network-order word
+   * 
+   * RFC 1624:
    *
-   * There is no dedicated doRead/when block: funct=2 sets xd (via
-   * the ROCC_INSTRUCTION_D macro) and carries no other behavior, so
-   * it's already fully handled by this generic response path, which
-   * returns accum to any instruction that sets xd.
+   *   C' = ~(~C + ~old + new)
+   * 
+   * checksumAccum stores the uncomplemented running sum S, where:
+   * 
+   *   C = ~S
+   * 
+   * therefore:
+   *
+   *   C' = ~(S + ~old + new)
+   * 
+   * So update the internal sum as:
+   *
+   *   S' = S + ~old + new
+   * 
+   * A later checksum_finalize() returns ~S', which is C'.
+   * 
+   * This operation: 
+   *
+   *   - is register-only
+   *   - does not use memory
+   *   - does not change the FSM
+   *   - does not modify XOR accum
+   *   - has no rd response
    */
+  when (cmd.fire && doChecksumUpdate) {
 
+    /* 
+     * RFC 1624 operates on 16-bit words.
+     */
+    val oldWord =
+      cmd.bits.rs1(15, 0)
+
+    val newWord =
+      cmd.bits.rs2(15, 0)
+
+    /* 
+     * Remove the old field contribution:
+     *
+     *   S + ~old
+     */
+    val afterRemoveOld =
+      onesComplementAdd16(
+        checksumAccum(15, 0),
+        ~oldWord 
+      )
+
+    /* 
+     * Add the replacement field:
+     *
+     *   (S + ~old) + new
+     */
+    val updatedSum =
+      onesComplementAdd16(
+        afterRemoveOld,
+        newWord
+      )
+
+    /* 
+     * Maintain the scalar checksum invariant:
+     *
+     *   checksumAccum[63:16] = 0
+     *   checksumAccum[15:0]  = current sum
+     */
+    checksumAccum :=
+      updatedSum.pad(xLen)
+  }
+
+  /*
+    * ------------------------------------------------------------
+    * CPU response
+    * ------------------------------------------------------------
+    *
+    * funct=2:
+    *   return XOR accum
+    * 
+    * funct=8:
+    *   return finalized RFC 1071 checksum
+    *   zero-extended to xLen
+    */
   io.resp.valid :=
     cmd.valid && 
     doResp && 
@@ -553,6 +647,9 @@ class XorFoldAcceleratorModuleImp(
       0.U
     )
   
+  /* 
+   * Full xLen-wide byte mask.
+   */
   io.mem.req.bits.mask := 
     Fill(xLen / 8, 1.U(1.W))
 
@@ -579,7 +676,8 @@ class XorFoldAcceleratorModuleImp(
        * where the write-side pointer/count logic would need to
        * become symmetric with the read-side logic below.
        */
-      state := sMemResp
+      state := 
+        sMemResp
 
     } .otherwise {
       /* 
@@ -624,7 +722,8 @@ class XorFoldAcceleratorModuleImp(
        * The response data field is not a value to fold.
        * Neither accum nor checksumAccum changes.
        */
-      state := sIdle 
+      state := 
+        sIdle 
     } .otherwise {
 
       /* 
@@ -640,22 +739,51 @@ class XorFoldAcceleratorModuleImp(
          */
         accum :=
           accum ^ io.mem.resp.bits.data 
+
       } .elsewhen (memOp === memChecksum) {
 
         /* 
-         * Interpret each 16-bit lane in network byte order before
-         * performing one's-complement addition.
+         * Step 1:
+         * 
+         * Convert each 16-bit lane from the little-endian memory
+         * representation into the RFC/network-order value.
          */
         val checksumWord =
-          networkOrder16Lanes(io.mem.resp.bits.data)
-
-        checksumAccum :=
-          onesComplementAdd64(
-            checksumAccum,
-            checksumWord
+          networkOrder16Lanes(
+            io.mem.resp.bits.data
           )
+        
+        /* 
+         * Step 2:
+         * 
+         * Fold the four RFC 16-bit words contained in this 64-bit
+         * memory beat into one 16-bit one's-complement contribution.
+         */
+        val beatSum =
+          fold64To16(
+            checksumWord 
+          )
+        
+        /* 
+         * Step 3:
+         * 
+         * Add the beat contribution into the persistent scalar
+         * checksum sum.
+         */
+        val nextChecksumSum =
+          onesComplementAdd16(
+            checksumAccum(15, 0),
+            beatSum
+          )
+        
+        /* 
+         * Preserve the invariant:
+         *
+         *   checksumAccum[63:16] = 0
+         */
+        checksumAccum :=
+          nextChecksumSum.pad(xLen)
       }
-
 
       /* 
        * remaining was already decremented when the corresponding 
@@ -669,9 +797,13 @@ class XorFoldAcceleratorModuleImp(
        * load in the stream.
        */
       when (remaining === 0.U) {
-        state := sIdle 
+
+        state := 
+          sIdle 
       } .otherwise {
-        state := sMemReq
+        
+        state := 
+          sMemReq
       }
     }
   }
