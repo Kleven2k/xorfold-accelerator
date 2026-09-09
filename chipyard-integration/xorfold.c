@@ -1,4 +1,5 @@
 #include "rocc.h"
+#include <stdint.h>
 
 unsigned long data = 0x1000;
 
@@ -14,6 +15,32 @@ unsigned long data_n[3] = {
 	0x11,
 	0x22,
 	0x44
+};
+
+/*
+ * RFC 1071 checksum test buffer.
+ * 
+ * Bytes are stored in network order:
+ *
+ *	00 01  00 02  00 03  00 04
+ *
+ * Therefore the conceptual 16-bit words are:
+ *
+ *	0x0001
+ *	0x0002
+ *	0x0003
+ *	0x0004
+ *
+ * Sum:
+ *
+ *	0x0001 + 0x0002 + 0x0003 + 0x0004 = 0x000A
+ */
+
+__attribute__((aligned(8))) unsigned char checksum_data[8] = {
+	0x00, 0x01,
+	0x00, 0x02,
+	0x00, 0x03,
+	0x00, 0x04
 };
 
 /*
@@ -71,9 +98,110 @@ static inline void xorfold_write_result(unsigned long *dst_ptr)
 	ROCC_INSTRUCTION_S(3, dst_ptr, 5);
 }
 
+/*
+ * RFC 1071 checksum instructions
+ */
+
+static inline void checksum_reset(void)
+{
+	/*
+	 * funct = 6
+	 *
+	 * checksumAccum = 0
+	 */
+	ROCC_INSTRUCTION(3, 6);
+}
+
+static inline void checksum_add_n(
+	void *ptr,
+	unsigned long n 
+)
+{
+	/*
+	 * funct = 7
+	 *
+	 * rs1 = starting buffer address
+	 * rs2 = number of 8-byte memory beats
+	 *
+	 * This operation accumulates on top of the existing
+	 * checksumAccum value. It does not reset it first.
+	 */
+	ROCC_INSTRUCTION_SS(3, ptr, n, 7);
+}
+
+static inline unsigned long checksum_finalize(void)
+{
+	unsigned long value;
+
+	/*
+	 * funct = 8
+	 *
+	 * Fold the 64-bit checksum accumulator down to 16 bits,
+	 * perform end-around carry, complement it, and return the
+	 * result zero-extended in rd.
+	 */
+	ROCC_INSTRUCTION_D(3, value, 8);
+
+	return value;
+}
+
+/*
+ * Independent software RFC 1071 implementation
+ *
+ * This operates directly on the byte stream in network order.
+ * It is intentionally independent of the accelerator's 64-bit
+ * intermediate representation.
+*/
+static uint16_t checksum_software(
+	const unsigned char *buf,
+	unsigned long len
+)
+{
+	uint32_t sum = 0;
+
+	while (len >= 2) {
+		uint16_t word =
+			((uint16_t)buf[0] << 8) | ((uint16_t)buf[1]);
+
+		sum += word;
+
+		/*
+		* End-around carry.
+		*/
+		sum = (sum & 0xFFFFU) + (sum >> 16);
+
+		buf += 2;
+		len -= 2;
+	}
+
+	/*
+	 * RFC 1071 permits an odd final byte. It occupies the high
+	 * byte of the final 16-bit word; the low byte is zero.
+	 *
+	 * The current hardware funct=7 does not yet support arbitrary
+	 * odd lengths, but keeping the software reference correct makes
+	 * it useful when that feature is added later.
+	*/
+	if (len != 0) {
+		sum += ((uint16_t)buf[0] << 8);
+
+		sum = (sum & 0xFFFFU) + (sum >> 16);
+	}
+
+	/*
+	 * One more fold in case the previous addition produced
+	 * another carry.
+	*/
+	sum = (sum & 0xFFFFU) + (sum >> 16);
+
+	return (uint16_t)(~sum);
+}
+
+
 int main(void)
 {
 	unsigned long result;
+	uint16_t software_checksum;
 
 	/* 
 	* Test 1: normal register folding. 
@@ -109,7 +237,7 @@ int main(void)
 		return 2;
 
 	/*
-	 * Test 3: reset.
+	 * Test 3: XOR accumulator reset.
 	 */
 	xorfold_reset();
 
@@ -214,6 +342,71 @@ int main(void)
 
 	if (result != 0x77)
 		return 7;
+
+	/*
+	 * Test 7: software RFC 1071 reference.
+	 *
+	 *	0001 + 0002 + 0003 + 0004 = 000A
+	 *	~000A = FFF5
+	 *
+	 * This verifies our hand-computed expected value independently
+	 * of the accelerator.
+	*/
+	software_checksum =
+		checksum_software(
+			checksum_data,
+			sizeof(checksum_data)
+		);
+
+	if (software_checksum != 0xFFF5)
+		return 8;
+
+	/*
+	 * Test 8: accelerator RFC 1071 checksum.
+	 *
+	 * First reset checksumAccum explicitly
+	*/
+	checksum_reset();
+
+	/*
+	 * checksum_data is exactly 8 bytes, so funct=7 needs one
+	 * 64-bit memory beat.
+	*/
+	checksum_add_n(
+		checksum_data,
+		1
+	);
+
+	/*
+	 * funct=8 cannot execute until funct=7's final memory response 
+	 * has returned and the FSM is back in sIdle.
+	*/
+	result = checksum_finalize();
+
+	/*
+	 * First compare agains the hand-computed RFC 1071 result.
+	*/
+	if (result != 0xFFF5)
+		return 9;
+
+	/*
+	 * Then independently comare hardware agains the software
+	 * implementation.
+	*/
+	if (result != software_checksum)
+		return 10;
+
+	/*
+	 * Test 9:  checksum reset is independent of XOR accum.
+	 *
+	 * checksum_reset() must only clear checksumAccum.
+	 *
+	 * XOR accum still contains 0x77 from Test 6.
+	*/
+	result = xorfold_read();
+
+	if (result != 0x77)
+		return 11;
 
 	return 0;
 }
