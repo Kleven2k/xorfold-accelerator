@@ -1,5 +1,5 @@
 diff --git a/.gitmodules b/.gitmodules
-index 8bfa9cac..1156f67a 100644
+index 8bfa9cac..41184899 100644
 --- a/.gitmodules
 +++ b/.gitmodules
 @@ -166,3 +166,6 @@
@@ -8,7 +8,7 @@ index 8bfa9cac..1156f67a 100644
  	url = https://github.com/ucb-bar/spec2026-workload.git
 +[submodule "generators/xorfold-accelerator"]
 +	path = generators/xorfold-accelerator
-+	url = /home/fredrik/projects/xorfold-accelerator
++	url = https://github.com/Kleven2k/xorfold-accelerator.git
 diff --git a/build.sbt b/build.sbt
 index f56621cc..b7076ec1 100644
 --- a/build.sbt
