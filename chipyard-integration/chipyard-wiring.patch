@@ -35,10 +35,10 @@ index f56621cc..b7076ec1 100644
  def withInitCheck(p: Project, genDirName: String): Project = {
    val checkTask = Def.task {
 diff --git a/generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala b/generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala
-index 2f8f15a6..074c6836 100644
+index 2f8f15a6..a71f2eec 100644
 --- a/generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala
 +++ b/generators/chipyard/src/main/scala/config/RoCCAcceleratorConfigs.scala
-@@ -15,3 +15,8 @@ class ReRoCCTestConfig extends Config(
+@@ -15,3 +15,17 @@ class ReRoCCTestConfig extends Config(
    new chipyard.config.WithAccumulatorRoCC ++                   // rerocc tile0 is accum
    new freechips.rocketchip.rocket.WithNHugeCores(1) ++
    new chipyard.config.AbstractConfig)
@@ -46,6 +46,15 @@ index 2f8f15a6..074c6836 100644
 +class XorFoldRoCCConfig extends Config(
 +  new chipyard.config.WithXorFoldRoCC ++
 +  new freechips.rocketchip.rocket.WithNBigCores(1) ++
++  new chipyard.config.AbstractConfig)
++
++// Same accelerator, attached to a BOOM (out-of-order) core instead of Rocket,
++// to verify the RoCC interface holds up against different core timing/hazard
++// behavior. Kept separate from XorFoldRoCCConfig since BOOM elaborates and
++// simulates noticeably slower than Rocket.
++class XorFoldRoCCBoomConfig extends Config(
++  new chipyard.config.WithXorFoldRoCC ++
++  new boom.v3.common.WithNSmallBooms(1) ++
 +  new chipyard.config.AbstractConfig)
 diff --git a/generators/chipyard/src/main/scala/config/fragments/RoCCFragments.scala b/generators/chipyard/src/main/scala/config/fragments/RoCCFragments.scala
 index 01064fcd..510e9898 100644

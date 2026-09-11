@@ -18,7 +18,10 @@ from a fresh chipyard checkout without needing a maintained chipyard fork.
     config fragment (uses `OpcodeSet.custom3`; custom1/custom2 are already used by
     chipyard's built-in `WithAccumulatorRoCC` / `WithCharacterCountRoCC` examples)
   - `generators/chipyard/.../config/RoCCAcceleratorConfigs.scala` — `XorFoldRoCCConfig`
-    (single Rocket core + the accelerator)
+    (single Rocket core + the accelerator) and `XorFoldRoCCBoomConfig` (same
+    accelerator, single BOOM out-of-order core instead — verifies the RoCC interface
+    isn't accidentally coupled to Rocket-specific timing; kept separate since BOOM
+    elaborates/simulates noticeably slower than Rocket)
   - `tests/CMakeLists.txt` — adds the `xorfold` / `xorfold-dump` build targets
 - `xorfold.c` — the baremetal RoCC test (not part of the patch since it's a new file;
   copy it in directly). Exercises funct=0 (reset), funct=1 (fold), funct=2 (read), and
