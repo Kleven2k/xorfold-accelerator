@@ -137,10 +137,7 @@ class XorFoldAcceleratorModuleImp(
    * funct=5 and funct=10 both use memWriteResult.
    */
 
-  val memXorFold :: 
-      memChecksum :: 
-      memWriteResult :: 
-        Nil = Enum(3)
+  val memXorFold :: memChecksum :: memWriteResult :: Nil = Enum(3)
 
   val memOp = 
     RegInit(memXorFold)
@@ -158,10 +155,7 @@ class XorFoldAcceleratorModuleImp(
    * sMemResp: 
    *   Wait for completion/response. 
    */
-  val sIdle :: 
-      sMemReq :: 
-      sMemResp :: 
-      Nil = Enum(3)
+  val sIdle :: sMemReq :: sMemResp :: Nil = Enum(3)
 
   val state = 
     RegInit(sIdle)
@@ -208,10 +202,7 @@ class XorFoldAcceleratorModuleImp(
    *
    *   request accepted; wait for D-channel response
    */
-  val tlIdle ::
-      tlReq ::
-      tlResp ::
-      Nil = Enum(3)
+  val tlIdle :: tlReq :: tlResp :: Nil = Enum(3)
 
   val tlState =
     RegInit(tlIdle)
