@@ -10,7 +10,7 @@ unsigned long data = 0x1000;
  * ^ 0x0044
  * --------
  *   0x0077
- */
+*/
 unsigned long data_n[3] = {
 	0x11,
 	0x22,
@@ -34,7 +34,7 @@ unsigned long data_n[3] = {
  * Sum:
  *
  *	0x0001 + 0x0002 + 0x0003 + 0x0004 = 0x000A
- */
+*/
 
 __attribute__((aligned(8))) unsigned char checksum_data[8] = {
 	0x00, 0x01,
@@ -47,14 +47,26 @@ __attribute__((aligned(8))) unsigned char checksum_data[8] = {
  * Must be volatile because the accelerator writes this location
  * through its own memory interface. GCC cannot otherwise see that
  * the custom instruction modifies this C object.
- */
+*/
 volatile unsigned long writeback = 0;
+
+/*
+ * Broadcast-write test destination.
+ *
+ * Also volatile because funct=10 modifies this buffer through the
+ * accelerator memory interface rather than through ordinary C stores.
+*/
+volatile unsigned long writeback_n[3] = {
+	0,
+	0,
+	0
+};
 
 /* 
  * ------------------------------------------------------------ 
  * XOR-fold operations 
  * ------------------------------------------------------------ 
- */
+*/
 
 static inline void xorfold_reset(void)
 {
@@ -87,8 +99,8 @@ static inline void xorfold_fold_mem_n(
 	 * funct = 4
 	 * 
 	 * rs1 = starting pointer
-	 * rs2 = number of words 
-	 */
+	 * rs2 = number of 64-bit words 
+	*/
 	ROCC_INSTRUCTION_SS(3, ptr, n, 4);
 }
 
@@ -99,14 +111,35 @@ static inline void xorfold_write_result(unsigned long *dst_ptr)
 	 *
 	 * rs1 = destination address
 	 * 
-	 * The accelerator writes the current accum value to memory.
-	 */
+	 * Write one copy of the current XOR accum value.
+	*/
 	ROCC_INSTRUCTION_S(3, dst_ptr, 5);
 }
 
 /*
- * RFC 1071 checksum instructions
- */
+ * funct = 10
+ * 
+ * write_result_n(dst_ptr, n)
+ *
+ * rs1 = starting destination address
+ * rs2 = number of 64-bit words
+ *
+ * The accelerator captures the current XOR accum value once and
+ * broadcasts that same value to n consecutive 64-bit words.
+*/
+static inline void xorfold_write_result_n(
+	unsigned long *dst_ptr,
+	unsigned long n
+)
+{
+	ROCC_INSTRUCTION_SS(3, dst_ptr, n, 10);
+}
+
+/*
+ * ------------------------------------------------------------ 
+ * RFC 1071 / RFC 1624 checksum operations 
+ * ------------------------------------------------------------
+*/
 
 static inline void checksum_reset(void)
 {
@@ -114,7 +147,7 @@ static inline void checksum_reset(void)
 	 * funct = 6
 	 *
 	 * checksumAccum = 0
-	 */
+	*/
 	ROCC_INSTRUCTION(3, 6);
 }
 
@@ -131,7 +164,7 @@ static inline void checksum_add_n(
 	 *
 	 * This operation accumulates on top of the existing
 	 * checksumAccum value. It does not reset it first.
-	 */
+	*/
 	ROCC_INSTRUCTION_SS(3, ptr, n, 7);
 }
 
@@ -142,10 +175,12 @@ static inline unsigned long checksum_finalize(void)
 	/*
 	 * funct = 8
 	 *
-	 * Fold the 64-bit checksum accumulator down to 16 bits,
-	 * perform end-around carry, complement it, and return the
-	 * result zero-extended in rd.
-	 */
+	 * checksumAccum already contains the scalar 16-bit running
+	 * one's-complement sum.
+	 *
+	 * Hardware complements that value and returns the finalized
+	 * RFC 1071 checksum zero-extended in rd.
+	*/
 	ROCC_INSTRUCTION_D(3, value, 8);
 
 	return value;
@@ -171,11 +206,12 @@ static inline void checksum_update(
 }
 
 /*
+ * ------------------------------------------------------------
  * Independent software RFC 1071 implementation
+ * ------------------------------------------------------------
  *
  * This operates directly on the byte stream in network order.
- * It is intentionally independent of the accelerator's 64-bit
- * intermediate representation.
+ * It is intentionally independent of the accelerator datapath.
 */
 static uint16_t checksum_software(
 	const unsigned char *buf,
@@ -191,7 +227,7 @@ static uint16_t checksum_software(
 		sum += word;
 
 		/*
-		* End-around carry.
+		 * End-around carry.
 		*/
 		sum = (sum & 0xFFFFU) + (sum >> 16);
 
@@ -229,10 +265,12 @@ int main(void)
 	uint16_t software_checksum;
 
 	/* 
-	* Test 1: normal register folding. 
-	* 
-	* 	0 ^ (5 + 3) = 8 
-	* 	8 ^ (1 + 1) = 10 
+	 * ------------------------------------------------------------
+	 * Test 1: normal register folding
+	 * 
+	 * 	 0 ^ (5 + 3) = 8 
+	 * 	 8 ^ (1 + 1) = 10 
+	 * ------------------------------------------------------------
 	*/
 
 	xorfold_reset();
@@ -245,13 +283,15 @@ int main(void)
 	if (result != 10)
 		return 1;
 
-	/* 
-	* Test 2: single-word fold from memory. 
-	* 
-	* 	accum = 0x000a
-	*	data  = 0x1000
-	*
-	* 	0x000a ^ 0x1000 = 0x100a 
+    /* 
+	 * ------------------------------------------------------------
+	 * Test 2: single-word fold from memory
+	 * 
+	 * 	 accum = 0x000a
+	 *	 data  = 0x1000
+	 * 
+	 * 	 0x000a ^ 0x1000 = 0x100a 
+	 * ------------------------------------------------------------
 	*/
 
 	xorfold_fold_mem(&data);
@@ -262,8 +302,10 @@ int main(void)
 		return 2;
 
 	/*
-	 * Test 3: XOR accumulator reset.
-	 */
+	 * ------------------------------------------------------------
+	 * Test 3: XOR accumulator reset
+	 * ------------------------------------------------------------
+	*/
 	xorfold_reset();
 
 	result = xorfold_read();
@@ -271,18 +313,20 @@ int main(void)
 		return 3;
 
 	/*
-	 * Test 4: autonomous N-word memory fold.
+	 * ------------------------------------------------------------
+	 * Test 4: autonomous N-word memory fold
 	 * 
 	 * One funct=4 instruction causes the accelerator to load:
 	 *
-	 *	data_n[0] = 0x11
-	 *  data_n[1] = 0x22
-	 *  data_n[2] = 0x44
+	 *   data_n[0] = 0x11
+	 *   data_n[1] = 0x22
+	 *   data_n[2] = 0x44
 	 *
 	 * Expected:
 	 *
-	 * 	0 ^ 0x11 ^ 0x22 ^ 0x44 = 0x77
-	 */
+	 * 	 0 ^ 0x11 ^ 0x22 ^ 0x44 = 0x77
+	 * ------------------------------------------------------------
+	*/
 	xorfold_fold_mem_n(data_n, 3);
 
 	result = xorfold_read();
@@ -291,16 +335,18 @@ int main(void)
 		return 4;
 
 	/*
-	 * Test 5: write the accumulator result back to memory.
+	 * ------------------------------------------------------------
+	 * Test 5: write the accumulator result back to memory
 	 *
 	 * Current accumulator value:
 	 *
-	 *	accum = 0x77
+	 *   accum = 0x77
 	 *
 	 * funct=5 should perform:
 	 * 
 	 *   writeback = 0x77
-	 */
+	 * ------------------------------------------------------------
+	*/
 	writeback = 0;
 
 	xorfold_write_result((unsigned long *)&writeback);
@@ -308,17 +354,13 @@ int main(void)
 	/*
 	 * Synchronize with the accelerator.
 	 *
-	 * write_result has no rd response, so its custom instruction can
-	 * be accepted before the accelerator's store transaction has fully
-	 * completed.
+	 * write_result has no rd response. A following xorfold_read()
+	 * cannot execute until the store has completed and the memory
+	 * FSM has returned to sIdle.
 	 *
-	 * A following RoCC read cannot execute until the memory FSM returns
-	 * to sIdle. For funct=5, that happens only after the store response
-	 * arrives.
-	 *
-	 * The returned vaue also verifies that write_result did not modify
-	 * accum.
-	 */
+	 * The returned value also verifies that the store operation did
+	 * not modify accum.
+	*/
 	result = xorfold_read();
 
 	if (result != 0x77)
@@ -348,17 +390,15 @@ int main(void)
 		return 6;
 
 	/*
+	 * ------------------------------------------------------------
 	 * Test 6: independently verify the stored value through the
 	 * accelerator itself.
 	 * 
 	 * Reset accum, then fold writeback from memory:
 	 * 
-	 *	0 ^ 0x77 = 0x77
-	 *
-	 * The explicit cast is used because writeback is volatile while
-	 * xorfold_fold_mem() only consumes the address and does not
-	 * dereference the pointer in C.
-	 */
+	 *   0 ^ 0x77 = 0x77
+	 * ------------------------------------------------------------
+	*/
 	xorfold_reset();
 
 	xorfold_fold_mem((unsigned long *)&writeback);
@@ -369,13 +409,15 @@ int main(void)
 		return 7;
 
 	/*
-	 * Test 7: software RFC 1071 reference.
+	 * ------------------------------------------------------------
+	 * Test 7: software RFC 1071 reference
 	 *
-	 *	0001 + 0002 + 0003 + 0004 = 000A
-	 *	~000A = FFF5
+	 *   0001 + 0002 + 0003 + 0004 = 000A
+	 *	 ~000A = FFF5
 	 *
 	 * This verifies our hand-computed expected value independently
 	 * of the accelerator.
+	 * ------------------------------------------------------------
 	*/
 	software_checksum =
 		checksum_software(
@@ -387,9 +429,9 @@ int main(void)
 		return 8;
 
 	/*
-	 * Test 8: accelerator RFC 1071 checksum.
-	 *
-	 * First reset checksumAccum explicitly
+	 * ------------------------------------------------------------
+	 * Test 8: accelerator RFC 1071 checksum
+	 * ------------------------------------------------------------
 	*/
 	checksum_reset();
 
@@ -415,16 +457,18 @@ int main(void)
 		return 9;
 
 	/*
-	 * Then independently comare hardware agains the software
+	 * Then compare hardware against the independent software
 	 * implementation.
 	*/
 	if (result != software_checksum)
 		return 10;
 
 	/*
-	 * Test 9:  RFC 1624 incremental checksum update.
+	 * ------------------------------------------------------------
+	 * Test 9:  RFC 1624 incremental checksum update
 	 *
 	 * Original words:
+	 *
 	 *   0001 0002 0003 0004
 	 *
 	 * Original uncomplemented sum:
@@ -448,6 +492,7 @@ int main(void)
 	 * RFC 1624 equivalent:
 	 *
 	 *   C' = ~(~C + ~old + new)
+	 * ------------------------------------------------------------
 	*/
 	checksum_update(
 		0x0002,
@@ -460,15 +505,145 @@ int main(void)
 		return 11;
 
 	/*
-	 * Test 10: verify the incremental update did not affect XOR accum.
+	 * ------------------------------------------------------------
+	 * Test 10: verify checksum operations did not affect XOR accum
 	 *
-	 * XOR accum should still contain 0x77 from the earlier XOR path.
+	 * XOR accum should still contain 0x77.
+	 * ------------------------------------------------------------
 	*/
 
 	result = xorfold_read();
 
 	if (result != 0x77)
 		return 12;
+
+	/*
+	 * ------------------------------------------------------------
+	 * Test 11: funct=10 broadcast write_result_n
+	 *
+	 * Current XOR accum:
+	 *
+	 *   0x77
+	 *
+	 * Operation:
+	 *
+	 *   write_result_(writeback_n, 3)
+	 *
+	 * Expected:
+	 *
+	 *   writeback_n[0] = 0x77
+	 *	 writeback_n[1] = 0x77
+	 *   writeback_n[2] = 0x77
+	 * ------------------------------------------------------------
+	*/
+	
+	writeback_n[0] = 0;
+	writeback_n[1] = 0;
+	writeback_n[2] = 0;
+	
+	xorfold_write_result_n(
+		(unsigned long *)writeback_n,
+		3
+	);
+
+	/*
+	 * Synchronize through another RoCC command.
+	 * 
+	 * This read cannot execute until all three stores have
+	 * completed and the memory FSM returns to sIdle.
+	 *
+	 * It also verifies that funct=10 does not modify accum.
+	*/
+	result = xorfold_read();
+
+	if (result != 0x77)
+		return 13;
+
+	/*
+	 * Ensure the CPU observes the accelerator stores before loading
+	 * writeback_n[].
+	*/
+	asm volatile(
+		"fence rw, rw"
+		:
+		:
+		: "memory"
+	);
+
+	if (writeback_n[0] != 0x77)
+		return 14;
+
+	if (writeback_n[1] != 0x77)
+		return 15;
+
+	if (writeback_n[2] != 0x77)
+		return 16;
+
+	/*
+	 * ------------------------------------------------------------
+	 * Test 12: funct=10 with n=0 must be a no-op
+	 *
+	 * Preload recognizable destination values:
+	 *
+	 *   writeback_n[0] = 0x1111
+	 *   writeback_n[1] = 0x2222
+	 *   writeback_n[2] = 0x3333
+	 *
+	 * Then issue:
+	 *
+	 *   write_result_n(writeback_n, 0)
+	 *
+	 * Hardware should issue no memory request and leave all three
+	 * values unchanged.
+	 * ------------------------------------------------------------
+	*/
+
+	writeback_n[0] = 0x1111;
+	writeback_n[1] = 0x2222;
+	writeback_n[2] = 0x3333;
+
+	/*
+	 * Make the initialization stores architecturally visible before
+	 * issuing the custom instruction.
+	*/
+	asm volatile(
+		"fence rw, rw"
+		:
+		:
+		: "memory"
+	);
+
+	xorfold_write_result_n(
+		(unsigned long *)writeback_n,
+		0
+	);
+
+	/*
+	 * n=0 should not start the memory FSM.
+	 *
+	 * This read should therefore proceed without waiting for any
+	 * accelerator memory transaction.
+	*/
+	result = xorfold_read();
+
+	if (result != 0x77)
+		return 17;
+
+	asm volatile(
+		"fence rw, rw"
+		:
+		:
+		: "memory"
+	);
+
+	if (writeback_n[0] != 0x1111)
+		return 18;
+
+	if (writeback_n[1] != 0x2222)
+		return 19;
+
+	if (writeback_n[2] != 0x3333)
+		return 20;
 
 	return 0;
 }
