@@ -14,6 +14,28 @@ class XorFoldAccelerator(opcodes: OpcodeSet)(implicit p: Parameters)
 
   override lazy val module = 
     new XorFoldAcceleratorModuleImp(this)
+
+  /* 
+   * Raw TileLink master used by funct=11.
+   * 
+   * This first milestone intentionally uses only one source ID /
+   * one outstanding request.
+   * 
+   * HasLazyRoCC automatically connects atlNode into the tile-local
+   * TileLink master crossbar.
+   */
+  override val atlNode =
+    TLClientNode(
+      Seq(
+        TLMasterPortParameters.v1(
+          Seq(
+            TLMasterParameters.v1(
+              "XorFoldTl"
+            )
+          )
+        )
+      )
+    )
 }
 
 class XorFoldAcceleratorModuleImp(
@@ -49,10 +71,9 @@ class XorFoldAcceleratorModuleImp(
    * 
    *   checksumAccum(15, 0)
    * 
-   * always contains the current 16-bit one's-complement running
-   * sum.
+   * contains the current scalar 16-bit one's-complement sum.
    * 
-   * Bits [63:16] are always zero.
+   * Bits [63:16] remains zero.
    * 
    * This scalar representation makes RFC 1624 incremental updates
    * direct and unambiguous.  
@@ -61,7 +82,7 @@ class XorFoldAcceleratorModuleImp(
 
   /*
    * ------------------------------------------------------------
-   * Memory-operation registers
+   * HellaCache memory-operation registers
    * ------------------------------------------------------------
    */
 
@@ -71,32 +92,37 @@ class XorFoldAcceleratorModuleImp(
   val ptr = RegInit(0.U(xLen.W))
   
   /* 
-   * Number of memory requests that have not yet been issued.
-   *  
-   * This counter is shared by both read and write streams and is
-   * decremented only when io.mem.req.fire occurs.
+   * Number of HellaCache requests not yet issued.
    */
-  val remaining = RegInit(0.U(xLen.W))
+  val remaining = 
+    RegInit(0.U(xLen.W))
 
   /* 
    * Preserve privilege information after the initiating command
    * leaves the RoCC command queue.
    */
-  val memDprv = RegInit(0.U(2.W))
-  val memDv   = RegInit(false.B)
+  val memDprv = 
+    RegInit(0.U(2.W))
+  
+  val memDv = 
+    RegInit(false.B)
 
   /* 
    * Latched write payload.
    * 
-   * funct=5 and funct=10 both capture accum once at command
-   * acceptance. For funct=10, the same value is broadcast
-   * every destination word.
+   * funct=5:
+   *   one write
+   * 
+   * funct=10:
+   *
+   *   broadcast same value to n writes
    */
-  val memWriteData = RegInit(0.U(xLen.W))
+  val memWriteData = 
+    RegInit(0.U(xLen.W))
 
   /* 
    * ------------------------------------------------------------
-   * Memory operation type
+   * HellaCache memory operation type
    * ------------------------------------------------------------
    *  
    * memXorFold:
@@ -111,11 +137,16 @@ class XorFoldAcceleratorModuleImp(
    * funct=5 and funct=10 both use memWriteResult.
    */
 
-  val memXorFold :: memChecksum :: memWriteResult :: Nil = Enum(3)
-  val memOp = RegInit(memXorFold)
+  val memXorFold :: 
+      memChecksum :: 
+      memWriteResult :: 
+        Nil = Enum(3)
+
+  val memOp = 
+    RegInit(memXorFold)
 
   /* ------------------------------------------------------------
-   * Main FSM
+   * HellaCache FSM
    * ------------------------------------------------------------
    * 
    * sIdle:
@@ -127,8 +158,69 @@ class XorFoldAcceleratorModuleImp(
    * sMemResp: 
    *   Wait for completion/response. 
    */
-  val sIdle :: sMemReq :: sMemResp :: Nil = Enum(3)
-  val state = RegInit(sIdle)
+  val sIdle :: 
+      sMemReq :: 
+      sMemResp :: 
+      Nil = Enum(3)
+
+  val state = 
+    RegInit(sIdle)
+
+  /* 
+   * ------------------------------------------------------------
+   * Raw TileLink registers / FSM
+   * ------------------------------------------------------------
+   * 
+   * This path is intentionally independent of the HellaCache FSM.
+   */
+
+  /* 
+   * Address captures from rs1 when funct=11 is accepted.
+   * 
+   * It must remain stable from command acceptance until the 
+   * TileLink A-channel request is accepted.
+   */
+  val tlAddr =
+    RegInit(0.U(xLen.W))
+
+  /* 
+   * Debug-only error flag for this first TileLink milestone.
+   * 
+   * Set when:
+   *
+   *   - edge.Get reports that the requested transfer is illegal, or
+   *   - the D-channel response is denied/corrupt.
+   * 
+   * Software cannot read this flag yet. It is intended for waveform
+   * inspection during this milestone
+   */
+  val tlError =
+    RegInit(false.B)
+
+  /* 
+   * tlIdle:
+   *   no TileLink operation active
+   * 
+   * tlReq:
+   *   generate/present one 64-bit Get
+   * 
+   * tlResp:
+   *
+   *   request accepted; wait for D-channel response
+   */
+  val tlIdle ::
+      tlReq ::
+      tlResp ::
+      Nil = Enum(3)
+
+  val tlState =
+    RegInit(tlIdle)
+
+  /* 
+   * TileLink output port and negotiated edge.
+   */
+  val (tlOut, tlEdge) =
+    outer.atlNode.out(0)
 
   /*
    * ------------------------------------------------------------
@@ -136,14 +228,16 @@ class XorFoldAcceleratorModuleImp(
    * ------------------------------------------------------------
    */
 
-  val cmd = Queue(io.cmd)
+  val cmd = 
+    Queue(io.cmd)
 
-  val funct = cmd.bits.inst.funct
+  val funct = 
+    cmd.bits.inst.funct
 
   val doReset            = funct === 0.U
   val doFold             = funct === 1.U
 
-  // funct=2 is the ordinary accum read via the generic response path.
+  // funct=2 = ordinary XOR accumulator read
   
   val doFoldMem          = funct === 3.U
   val doFoldMemN         = funct === 4.U
@@ -155,8 +249,13 @@ class XorFoldAcceleratorModuleImp(
   val doWriteResultN     = funct === 10.U
 
   /* 
+   * Raw TileLink equivalent of funct=3.
+   */
+  val doFoldMemTL        = funct === 11.U
+
+  /* 
    * ------------------------------------------------------------
-   * Helper: start a memory transaction
+   * Helper: start HellaCache memory operation
    * ------------------------------------------------------------
    *  
    * Every operation that enters sMemReq should go through this
@@ -172,6 +271,7 @@ class XorFoldAcceleratorModuleImp(
       dprv: UInt,
       dv: Bool
   ): Unit = {
+
     ptr          := addr
     remaining    := count 
     memOp        := op
@@ -179,7 +279,8 @@ class XorFoldAcceleratorModuleImp(
     memDprv      := dprv 
     memDv        := dv 
 
-    state        := sMemReq  
+    state := 
+      sMemReq  
   }
 
   /* 
@@ -197,7 +298,10 @@ class XorFoldAcceleratorModuleImp(
    * The carry is then wrapped back into bit 0.  
    */
 
-  def onesComplementAdd16(a: UInt, b: UInt): UInt = {
+  def onesComplementAdd16(
+      a: UInt, 
+      b: UInt
+  ): UInt = {
     
     val wideSum =
       a(15, 0) +& b(15, 0)
@@ -210,8 +314,7 @@ class XorFoldAcceleratorModuleImp(
 
   /* 
    * ------------------------------------------------------------
-   * Helper: convert a little-endian RV64 memory beat into four
-   * network-order 16-bit words
+   * Helper: little-endian RV64 beat -> network-order 16-bit lanes
    * ------------------------------------------------------------
    *  
    * Example memory bytes:
@@ -232,7 +335,9 @@ class XorFoldAcceleratorModuleImp(
    * Therefore swap the two bytes within every 16-bit lane.
    */
 
-  def networkOrder16Lanes(d: UInt): UInt = {
+  def networkOrder16Lanes(
+      d: UInt
+  ): UInt = {
 
     Cat(
       d(55, 48), d(63, 56),
@@ -244,7 +349,7 @@ class XorFoldAcceleratorModuleImp(
 
   /* 
    * ------------------------------------------------------------
-   * Helper: fold four 16-bit words into one RFC 1071 sum
+   * Helper: four 16-bit words -> one RFC 1071 sum
    * ------------------------------------------------------------
    * 
    * Input:
@@ -309,12 +414,24 @@ class XorFoldAcceleratorModuleImp(
 
   /*
    * ------------------------------------------------------------
-   * RoCC command handling
+   * Global accelerator-idle definition
    * ------------------------------------------------------------
+   * 
+   * For this first TileLink milestone, HellaCache and raw TileLink
+   * operations are deliberately serialized.
+   * 
+   * A new RoCC command can execute only when BOTH memory engines
+   * are idle.
    */
 
-  val idle = 
+  val memIdle =
     state === sIdle 
+  
+  val tlIdleNow =
+    tlState === tlIdle
+
+  val idle = 
+    memIdle && tlIdleNow
 
   /* 
    * xd means the instruction expects a response through io.resp.
@@ -482,6 +599,7 @@ class XorFoldAcceleratorModuleImp(
    */
 
   /* 
+   * ------------------------------------------------------------
    * funct = 9
    * 
    * checksum_update(oldWord, newWord)
@@ -516,6 +634,7 @@ class XorFoldAcceleratorModuleImp(
    *   - does not change the FSM
    *   - does not modify XOR accum
    *   - has no rd response
+   * ------------------------------------------------------------
    */
   when (cmd.fire && doChecksumUpdate) {
 
@@ -561,6 +680,7 @@ class XorFoldAcceleratorModuleImp(
   }
 
   /* 
+   * ------------------------------------------------------------
    * funct = 10
    * 
    * write_result_n(dst_ptr, n)
@@ -583,6 +703,7 @@ class XorFoldAcceleratorModuleImp(
    *   [dst + 16] = 0x77
    * 
    * n == 0 is a no-op.
+   * ------------------------------------------------------------
    */
 
   when (cmd.fire && doWriteResultN) {
@@ -600,9 +721,48 @@ class XorFoldAcceleratorModuleImp(
     }
   }
 
+  /* 
+   * ------------------------------------------------------------
+   * funct = 11
+   * 
+   * fold_mem_tl(ptr)
+   * 
+   * Raw TileLink counterpart of funct=3.
+   * 
+   * rs1 = address of one 64-bit word
+   * 
+   * Semantics:
+   *
+   *   accum := accum ^ memory[rs1]
+   * 
+   * This first version allows exactly one outstanding TL request.
+   * ------------------------------------------------------------
+   */
+
+  when (cmd.fire && doFoldMemTL) {
+
+    /* 
+     * Capture the address before the command leaves the queue.
+     * 
+     * The subsequent TileLink transaction depends only on tlAddr,
+     * never on cmd.bits.
+     */
+    tlAddr :=
+      cmd.bits.rs1
+
+    /* 
+     * Clear the debug error flag at the start of each new TL op.
+     */
+    tlError :=
+      false.B
+
+    tlState :=
+      tlReq
+  }
+
   /*
     * ------------------------------------------------------------
-    * CPU response
+    * CPU response path
     * ------------------------------------------------------------
     *
     * funct=2:
@@ -629,7 +789,7 @@ class XorFoldAcceleratorModuleImp(
 
   /*
    * ------------------------------------------------------------
-   * Memory request
+   * HellaCache path
    * ------------------------------------------------------------
    * 
    * Once the FSM enters sMemReq, the request no longer depends
@@ -699,8 +859,15 @@ class XorFoldAcceleratorModuleImp(
    * Enable all bytes of the 64-bit memory operation.
    */
   io.mem.req.bits.mask := 
-    Fill(xLen / 8, 1.U(1.W))
+    Fill(
+      xLen / 8, 
+      1.U(1.W))
 
+  /* 
+   * HellaCache path uses virtual-address translation.
+   * 
+   * This differs from the raw TileLink path below.
+   */
   io.mem.req.bits.phys := 
     false.B 
 
@@ -715,7 +882,7 @@ class XorFoldAcceleratorModuleImp(
 
   /* 
    * ------------------------------------------------------------
-   * Memory request accepted
+   * HellaCache request accepted
    * ------------------------------------------------------------
    * 
    * Stream bookkeeping is identical for reads and writes.
@@ -751,7 +918,7 @@ class XorFoldAcceleratorModuleImp(
 
   /*
    * ------------------------------------------------------------
-   * Memory response / completion
+   * HellaCache response / completion
    * ------------------------------------------------------------
    */
 
@@ -831,12 +998,125 @@ class XorFoldAcceleratorModuleImp(
 
       state :=
         sIdle
+
     } .otherwise {
 
       state :=
         sMemReq 
     }
   }
+
+  /* 
+   * ============================================================
+   * Raw TileLink path - funct=11
+   * ============================================================
+   */
+
+  /* 
+   * Generate one 8-byte Get using source ID 0.
+   * 
+   * edge.Get is combinational, so tlGetLegal is known before an
+   * A-channel handshake occurs.
+   */
+  val (tlGetLegal, tlGet) =
+    tlEdge.Get(
+      fromSource = 0.U,
+      toAddress  = tlAddr,
+      lgSize     = log2Ceil(xLen / 8).U
+    )
+
+  /* 
+   * Present the request only if TileLink diplimacy reports that
+   * this manager/address/size combination legally supports Get.
+   * 
+   * An illegal transaction is therefore rejected locally; we do
+   * not knowingly assert A.valid for it.
+   */
+  tlOut.a.valid :=
+    (tlState === tlReq) && tlGetLegal 
+  
+  tlOut.a.bits :=
+    tlGet 
+
+  /* 
+   * IF the request is already known to be illegal, abort it before
+   * an A-channel transfer can occur.
+   */
+  when (tlState === tlReq && !tlGetLegal) {
+    
+    tlError :=
+      true.B 
+
+    tlState :=
+      tlIdle
+  }
+
+  /* 
+   * Once the Get has actually been accepted, wait for exactly one
+   * D-channel response.
+   */
+  when (tlOut.a.fire) {
+
+    tlState :=
+      tlResp
+  }
+
+  /* 
+   * Only accept a D response while this TL operation is waiting
+   * for one.
+   */
+  tlOut.d.ready :=
+    tlState === tlResp 
+
+  /* 
+   * Single-beat 64-bit Get response.
+   * 
+   * The loaded data is treated as an opaque 64-bit value, exactly
+   * like funct=3. No network-order conversion is needed for XOR.
+   */
+  when (tlOut.d.fire) {
+
+    /* 
+     * Do not modify accum if TileLink reports a failed transfer.
+     * 
+     * denied:
+     *   manager rejected the access
+     * 
+     * corrupt:
+     * 
+     *   returned data is marked corrupt
+     */
+
+    when (
+      tlOut.d.bits.denied || tlOut.d.bits.corrupt
+    ) {
+      tlError :=
+        true.B
+    } .otherwise {
+
+      accum :=
+        accum ^ tlOut.d.bits.data
+    }
+
+    tlState :=
+      tlIdle
+  }
+
+  /* 
+   * This client issues only ordinary Gets, so it does not use the
+   * B, C, or E channels.
+   * 
+   * This matches the tie-offs used by Rocket Chip's current
+   * CharacterCountExample.
+   */
+  tlOut.b.ready :=
+    true.B 
+
+  tlOut.c.valid :=
+    false.B 
+
+  tlOut.e.valid :=
+    false.B
 
   /*
    * ------------------------------------------------------------
@@ -846,8 +1126,9 @@ class XorFoldAcceleratorModuleImp(
 
   io.busy :=
     cmd.valid ||
-    state =/= sIdle 
+    state =/= sIdle ||
+    tlState =/= tlIdle
 
-  io.interrupt := false.B 
-
+  io.interrupt := 
+    false.B 
 }
