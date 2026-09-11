@@ -38,7 +38,7 @@ class XorFoldAcceleratorModuleImp(
    */
 
   /* 
-   * Existing XOR-fold accumulator.
+   * XOR-fold accumulator.
    */
   val accum = RegInit(0.U(xLen.W))
 
@@ -73,16 +73,25 @@ class XorFoldAcceleratorModuleImp(
   /* 
    * Number of memory requests that have not yet been issued.
    *  
-   * For streaming reads this is decremented when mem.req.fire
-   * occurs, not when the response arrives.
+   * This counter is shared by both read and write streams and is
+   * decremented only when io.mem.req.fire occurs.
    */
   val remaining = RegInit(0.U(xLen.W))
 
-  // Preserve privilege information for autonomous memory accesses.
+  /* 
+   * Preserve privilege information after the initiating command
+   * leaves the RoCC command queue.
+   */
   val memDprv = RegInit(0.U(2.W))
   val memDv   = RegInit(false.B)
 
-  // Store payload used by funct=5.
+  /* 
+   * Latched write payload.
+   * 
+   * funct=5 and funct=10 both capture accum once at command
+   * acceptance. For funct=10, the same value is broadcast
+   * every destination word.
+   */
   val memWriteData = RegInit(0.U(xLen.W))
 
   /* 
@@ -98,6 +107,8 @@ class XorFoldAcceleratorModuleImp(
    *  
    * memWriteResult: 
    *   Store memWriteData to memory.
+   * 
+   * funct=5 and funct=10 both use memWriteResult.
    */
 
   val memXorFold :: memChecksum :: memWriteResult :: Nil = Enum(3)
@@ -141,6 +152,7 @@ class XorFoldAcceleratorModuleImp(
   val doChecksumAddN     = funct === 7.U 
   val doChecksumFinalize = funct === 8.U 
   val doChecksumUpdate   = funct === 9.U
+  val doWriteResultN     = funct === 10.U
 
   /* 
    * ------------------------------------------------------------
@@ -148,10 +160,8 @@ class XorFoldAcceleratorModuleImp(
    * ------------------------------------------------------------
    *  
    * Every operation that enters sMemReq should go through this
-   * helper.
-   *  
-   * That gives us one place where all persistent transaction
-   * state is initialized.
+   * helper so all persistent transaction state is initialized
+   * together.
    */
 
   def startMemOp(
@@ -168,6 +178,7 @@ class XorFoldAcceleratorModuleImp(
     memWriteData := writeData
     memDprv      := dprv 
     memDv        := dv 
+
     state        := sMemReq  
   }
 
@@ -290,9 +301,8 @@ class XorFoldAcceleratorModuleImp(
    * RFC 1071 finalization
    * ------------------------------------------------------------
    * 
-   * checksumAccum is already maintained as a scalar 16-bit sum.
-   * 
-   * Therefore finalization is simply the one's complement.
+   * checksumAccum is already maintained as a scalar 16-bit sum,
+   * so finalization is simply the one's complement.
    */
   val checksumFinal =
     ~checksumAccum(15, 0)
@@ -308,9 +318,6 @@ class XorFoldAcceleratorModuleImp(
 
   /* 
    * xd means the instruction expects a response through io.resp.
-   *  
-   * If the response interface cannot accept it, don't consume
-   * the command yet.
    */
   val doResp = 
     cmd.bits.inst.xd 
@@ -319,37 +326,30 @@ class XorFoldAcceleratorModuleImp(
     doResp && !io.resp.ready 
 
   /* 
-   * While the memory FSM is active, no subsequent RoCC command
-   * may execute.
-   *  
-   * This is what serializes:
-   * 
-   *   fold_mem_n(...)
-   *   xorfold_read()
-   *  
-   * The read cannot fire until the final memory response has been
-   * processed and state returns to sIdle.
+   * No new RoCC command executes while the memory FSM is active.
    */
   cmd.ready := 
     idle && !stallResp
 
   /*
+   * ------------------------------------------------------------
    * funct = 0
    * 
    * XOR accumulator reset.
+   * ------------------------------------------------------------
    */
   when (cmd.fire && doReset) {
     accum := 0.U
   }
 
   /*  
+   * ------------------------------------------------------------
    * funct = 1
    *  
-   * Existing register/register XOR fold:
-   * 
-   *   fold(rs1, rs2)
-   * 
+   * Register/register XOR fold:
+   *
    *   accum ^= rs1 + rs2
+   * ------------------------------------------------------------
    */
   when (cmd.fire && doFold) {
     accum := 
@@ -357,11 +357,13 @@ class XorFoldAcceleratorModuleImp(
   }
 
   /* 
+   * ------------------------------------------------------------
    * funct = 3
    *  
    * fold_mem(ptr)
    *  
    * One-word XOR memory fold.
+   * ------------------------------------------------------------
    */
   when (cmd.fire && doFoldMem) {
 
@@ -376,6 +378,7 @@ class XorFoldAcceleratorModuleImp(
   }
 
   /* 
+   * ------------------------------------------------------------
    * funct = 4
    *  
    * fold_mem_n(ptr, n)
@@ -384,6 +387,7 @@ class XorFoldAcceleratorModuleImp(
    * rs2 = word count (number of xLen-sized words)
    *  
    * n == 0 is a no-op.
+   * ------------------------------------------------------------
    */
   when (cmd.fire && doFoldMemN) {
 
@@ -400,16 +404,15 @@ class XorFoldAcceleratorModuleImp(
   }
 
   /* 
+   * ------------------------------------------------------------
    * funct = 5
    *  
    * write_result(dst_ptr)
-   *  
-   * rs1 = destination address
    * 
-   * Store the existing XOR accumulator to memory.
+   * Single-word write.
    *  
-   * Capture the accumulator at command acceptance so the complete
-   * store transaction is independent of cmd.bits afterward.
+   * This is now simply the n=1 version of write_result_n()
+   * ------------------------------------------------------------
    */
   when (cmd.fire && doWriteResult) {
 
@@ -424,21 +427,21 @@ class XorFoldAcceleratorModuleImp(
   }
 
   /* 
+   * ------------------------------------------------------------
    * funct = 6
    * 
    * checksum_reset()
    * 
    * Reset only the checksum accumulator.
-   * 
-   * The existing XOR accum remains untouched.
+   * ------------------------------------------------------------
    */
-
   when (cmd.fire && doChecksumReset) {
 
     checksumAccum := 0.U
   }
 
   /* 
+   * ------------------------------------------------------------
    * funct = 7
    * 
    * checksum_add_n(ptr, n)
@@ -446,15 +449,14 @@ class XorFoldAcceleratorModuleImp(
    * rs1 = starting buffer address
    * rs2 = number of 8-byte memory beats
    * 
-   * This does NOT reset checksumAccum first. Multiple funct=7
-   * operations may therefore be chained after one funct=6 reset.
+   * This does not reset checksumAccum automatically.
    * 
    * n == 0 is a no-op.
    */
-
   when (cmd.fire && doChecksumAddN) {
 
     when (cmd.bits.rs2 =/= 0.U) {
+
       startMemOp(
         addr      = cmd.bits.rs1,
         count     = cmd.bits.rs2,
@@ -467,16 +469,16 @@ class XorFoldAcceleratorModuleImp(
   }
 
   /* 
+   * ------------------------------------------------------------
    * funct = 8
    * 
    * checksum_finalize()
    * 
    * No state-changing when-block is required.
    * 
-   * The generic response path below returns checksumFinal for this
-   * funct when xd is set.
-   * 
+   * The generic response path returns checksumFinal.
    * checksumAccum itself is not modified.
+   * ------------------------------------------------------------
    */
 
   /* 
@@ -558,6 +560,46 @@ class XorFoldAcceleratorModuleImp(
       updatedSum.pad(xLen)
   }
 
+  /* 
+   * funct = 10
+   * 
+   * write_result_n(dst_ptr, n)
+   * 
+   * rs1 = starting destination address
+   * rs2 = number of 64-bit words to write
+   * 
+   * The current accum value is captured once when the command is
+   * accepted and broadcast to all n consecutive destination words.
+   * 
+   * Example:
+   *
+   *   accum = 0x77
+   *   n     = 3
+   * 
+   * produces:
+   * 
+   *   [dst +  0] = 0x77
+   *   [dst +  8] = 0x77
+   *   [dst + 16] = 0x77
+   * 
+   * n == 0 is a no-op.
+   */
+
+  when (cmd.fire && doWriteResultN) {
+
+    when (cmd.bits.rs2 =/= 0.U) {
+
+      startMemOp(
+        addr      = cmd.bits.rs1,
+        count     = cmd.bits.rs2 ,
+        op        = memWriteResult,
+        writeData = accum,
+        dprv      = cmd.bits.status.dprv,
+        dv        = cmd.bits.status.dv 
+      )
+    }
+  }
+
   /*
     * ------------------------------------------------------------
     * CPU response
@@ -590,7 +632,7 @@ class XorFoldAcceleratorModuleImp(
    * Memory request
    * ------------------------------------------------------------
    * 
-   * Once the FSM enters sMemReq, the requesst no longer depends
+   * Once the FSM enters sMemReq, the request no longer depends
    * on cmd.bits.
    */
 
@@ -606,11 +648,14 @@ class XorFoldAcceleratorModuleImp(
   /* 
    * Memory command depends on the latched memory operation type.
    * 
-   * Loads for funct=3/4.
-   * Store for funct=5.
+   * memXorFold:
+   *   load for funct=3 / funct=4
    * 
-   * Both XOR folding and checksum accumulation perform loads.
-   * write_result performs a store.
+   * memChecksum:
+   *   load for funct=7
+   * 
+   * memWriteResult:
+   *   store for funct=5 / funct=10
    */
   io.mem.req.bits.cmd := 
     Mux(
@@ -636,9 +681,12 @@ class XorFoldAcceleratorModuleImp(
     false.B 
   
   /* 
-   * Read data field is unused.
-   *  
-   * For funct=5, this is the value written to memory.
+   * Read operations do not use req.bits.data.
+   * 
+   * For memWriteResult, this is the latched accum value written by:
+   *
+   *   funct=5  -> one destination word
+   *   funct=10 -> n consecutive destination words
    */
   io.mem.req.bits.data :=
     Mux(
@@ -648,62 +696,57 @@ class XorFoldAcceleratorModuleImp(
     )
   
   /* 
-   * Full xLen-wide byte mask.
+   * Enable all bytes of the 64-bit memory operation.
    */
   io.mem.req.bits.mask := 
     Fill(xLen / 8, 1.U(1.W))
 
-  io.mem.req.bits.phys    := false.B 
-  io.mem.req.bits.dprv    := memDprv
-  io.mem.req.bits.dv      := memDv 
-  io.mem.req.bits.no_resp := false.B 
+  io.mem.req.bits.phys := 
+    false.B 
+
+  io.mem.req.bits.dprv := 
+    memDprv
+
+  io.mem.req.bits.dv := 
+    memDv 
+
+  io.mem.req.bits.no_resp := 
+    false.B 
 
   /* 
    * ------------------------------------------------------------
    * Memory request accepted
    * ------------------------------------------------------------
+   * 
+   * Stream bookkeeping is identical for reads and writes.
+   * 
+   * A request counts as issued only when io.mem.req.fire occurs.
    */
 
   when (state === sMemReq && io.mem.req.fire) {
 
-    when (memOp === memWriteResult) {
-      /* 
-       * funct=5 currently performs exactly one store.
-       *  
-       * We therefore simply wait for its completion response.
-       *  
-       * If a future funct=6 implements write_result_n, this is
-       * where the write-side pointer/count logic would need to
-       * become symmetric with the read-side logic below.
-       */
-      state := 
-        sMemResp
+    /* 
+     * Advance to the next 64-bit word.
+     */
+    ptr :=
+      ptr + (xLen / 8).U 
 
-    } .otherwise {
-      /* 
-       * Both XOR streaming and checksum streaming walk forward by
-       * one 64-bit memory beat.
-       *  
-       * Only advance ptr when the cache actually accepts the
-       * request. 
-       */
-      ptr :=
-        ptr + (xLen / 8).U
-      
-      /* 
-       * remaining means:
-       * 
-       *  number of requests not yet issued
-       *  
-       * Therefore decrement when re.fire happens, not when the
-       * response arrives.
-       */
-      remaining :=
-        remaining - 1.U 
+    /* 
+     * remaining means:
+     * 
+     *   number of memory requests not yet issued
+     * 
+     * so decrement it when the request is actually accepted.
+     */
+    remaining :=
+      remaining - 1.U
 
-      state := 
-        sMemResp
-    }
+    /* 
+     * Wait for this operation's response before issuing the next
+     * request.
+     */
+    state :=
+      sMemResp 
   }
 
   /*
@@ -714,97 +757,84 @@ class XorFoldAcceleratorModuleImp(
 
   when (state === sMemResp && io.mem.resp.valid) {
 
-    when (memOp === memWriteResult) {
+    /* 
+     * Only reads consume resp.bits.data.
+     * 
+     * Stores simply use resp.valid as the completion indication.
+     */
+
+    when (memOp === memXorFold) {
 
       /* 
-       * Store completed.
-       *  
-       * The response data field is not a value to fold.
-       * Neither accum nor checksumAccum changes.
+       * XOR memory fold.
        */
-      state := 
-        sIdle 
+      accum :=
+        accum ^ io.mem.resp.bits.data 
+      
+      
+    } .elsewhen (memOp === memChecksum) {
+
+      /* 
+       * Step 1:
+       *
+       * Convert each 16-bit lane from the little-endian memory
+       * representation into the RFC/network-order value.
+       */
+      val checksumWord =
+        networkOrder16Lanes(
+          io.mem.resp.bits.data
+        )
+      
+      /* 
+       * Step 2:
+       *
+       * Fold the four 16-bit words in this 64-bit beat into one
+       * 16-bit one's-complement contribution.
+       */
+      val beatSum =
+        fold64To16(
+          checksumWord
+        )
+
+      /* 
+       * Step 3:
+       *
+       * Add this beat's contribution onto the scalar checksum.
+       */
+      val nextChecksumSum =
+        onesComplementAdd16(
+          checksumAccum(15, 0),
+          beatSum 
+        )
+
+      checksumAccum :=
+        nextChecksumSum.pad(xLen)
+    }
+
+    /* 
+     * memWriteResult intentionally has no data-path update here.
+     * 
+     * The store response only tells us that the current write has
+     * completed.
+     */
+
+    /* 
+     * Shared stream control:
+     *
+     * remaining was decremented when the corresponding request
+     * fired.
+     * 
+     * Therefore remaining === 0 means the response arriving now
+     * belongs to the final operation in the stream.
+     */
+    when (remaining === 0.U) {
+
+      state :=
+        sIdle
     } .otherwise {
 
-      /* 
-       * ------------------------------------------------------------
-       * Read-response datapath
-       * ------------------------------------------------------------
-       */
-
-      when (memOp === memXorFold) {
-
-        /* 
-         * Existing XOR behavior.
-         */
-        accum :=
-          accum ^ io.mem.resp.bits.data 
-
-      } .elsewhen (memOp === memChecksum) {
-
-        /* 
-         * Step 1:
-         * 
-         * Convert each 16-bit lane from the little-endian memory
-         * representation into the RFC/network-order value.
-         */
-        val checksumWord =
-          networkOrder16Lanes(
-            io.mem.resp.bits.data
-          )
-        
-        /* 
-         * Step 2:
-         * 
-         * Fold the four RFC 16-bit words contained in this 64-bit
-         * memory beat into one 16-bit one's-complement contribution.
-         */
-        val beatSum =
-          fold64To16(
-            checksumWord 
-          )
-        
-        /* 
-         * Step 3:
-         * 
-         * Add the beat contribution into the persistent scalar
-         * checksum sum.
-         */
-        val nextChecksumSum =
-          onesComplementAdd16(
-            checksumAccum(15, 0),
-            beatSum
-          )
-        
-        /* 
-         * Preserve the invariant:
-         *
-         *   checksumAccum[63:16] = 0
-         */
-        checksumAccum :=
-          nextChecksumSum.pad(xLen)
-      }
-
-      /* 
-       * remaining was already decremented when the corresponding 
-       * request fired.
-       *  
-       * Therefore:
-       *  
-       *  remaining == 0
-       *  
-       * means the response that just arrived belongs to the final
-       * load in the stream.
-       */
-      when (remaining === 0.U) {
-
-        state := 
-          sIdle 
-      } .otherwise {
-        
-        state := 
-          sMemReq
-      }
+      state :=
+        sMemReq 
     }
   }
 
