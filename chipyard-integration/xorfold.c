@@ -135,6 +135,25 @@ static inline void xorfold_write_result_n(
 	ROCC_INSTRUCTION_SS(3, dst_ptr, n, 10);
 }
 
+static inline void xorfold_fold_mem_tl(unsigned long *ptr)
+{
+	/*
+	 * funct = 11
+	 *
+	 * Raw TileLink equivalent of funct=3.
+	 *
+	 * rs1 = address of one 64-bit word
+	 *
+	 * Hardware performs:
+	 *
+	 *   accum := accum ^ memory[rs1]
+	 *
+	 * This first TileLink implementation permits only one
+	 * outstanding request.
+	*/
+	ROCC_INSTRUCTION_S(3, ptr, 11);
+}
+
 /*
  * ------------------------------------------------------------ 
  * RFC 1071 / RFC 1624 checksum operations 
@@ -644,6 +663,105 @@ int main(void)
 
 	if (writeback_n[2] != 0x3333)
 		return 20;
+
+	/*
+	 * ------------------------------------------------------------
+	 * Test 13: funct=11 raw TileLink fold_mem_tl
+	 *
+	 * Compare the new raw-TileLink path directly agains the
+	 * existing funct=3 HellaCacheIO path.
+	 *
+	 * Test value:
+	 *
+	 *   data = 0x1000
+	 *
+	 * Both paths start from accum = 0, so both should produce:
+	 *
+	 *   0 ^ 0x1000 = 0x1000
+	 * ------------------------------------------------------------
+	*/
+
+	/*
+	 * First establish the known-good funct=3 reference result.
+	*/
+	xorfold_reset();
+
+	xorfold_fold_mem(&data);
+
+	result = xorfold_read();
+
+	if (result != 0x1000)
+		return 21;
+
+	/*
+	 * Now perform the same operation using the raw TileLink path.
+	 *
+	 * Reset first so this is a direct A/B comparison rather than:
+	 *
+	 *   0x1000 ^ 0x1000 = 0
+	*/
+	xorfold_reset();
+
+	xorfold_fold_mem_tl(&data);
+
+	/*
+	 * xorfold_read() serialize with funct=11 because the accelerator's
+	 * global idle condition requires both:
+	 *
+	 *   HellaCache FSM == idle
+	 *   TileLink FSM   == idle
+	 *
+	 * Therefore this read cannot execute until the TileLink response
+	 * has returned and funct=11 has either:
+	 *
+	 *   - XORed the returned data into accum, or
+	 *   - terminated with tlError after an illegal/denied/corrupt access.
+	*/
+	result = xorfold_read();
+
+	if (result != 0x1000)
+		return 22;
+
+	/*
+	 * ------------------------------------------------------------
+	 * Test 14: direct funct=3 versus funct=11 comparison
+	 *
+	 * Use a second recognizable value so the comparison is not tied
+	 * only to the original 0x1000 test constant.
+	 * ------------------------------------------------------------
+	*/
+
+	data = 0x1122334455667788UL;
+
+	/*
+	 * Existing HellaCacheIO path.
+	*/
+	xorfold_reset();
+
+	xorfold_fold_mem(&data);
+
+	result = xorfold_read();
+
+	if (result != 0x1122334455667788UL)
+		return 23;
+
+	/*
+	 * Raw TileLink path.
+	*/
+	xorfold_reset();
+
+	xorfold_fold_mem_tl(&data);
+
+	result = xorfold_read();
+
+	if (result != 0x1122334455667788UL)
+		return 24;
+
+	/*
+	 * Restore the original test value in case data is inspected after
+	 * program completion.
+	*/
+	data = 0x1000;
 
 	return 0;
 }
