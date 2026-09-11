@@ -50,6 +50,12 @@ __attribute__((aligned(8))) unsigned char checksum_data[8] = {
  */
 volatile unsigned long writeback = 0;
 
+/* 
+ * ------------------------------------------------------------ 
+ * XOR-fold operations 
+ * ------------------------------------------------------------ 
+ */
+
 static inline void xorfold_reset(void)
 {
 	ROCC_INSTRUCTION(3, 0);
@@ -143,6 +149,25 @@ static inline unsigned long checksum_finalize(void)
 	ROCC_INSTRUCTION_D(3, value, 8);
 
 	return value;
+}
+
+static inline void checksum_update(
+	unsigned long old_word,
+	unsigned long new_word
+)
+{
+	/*
+	 * funct = 9
+	 *
+	 * RFC 1624 incremental update.
+	 *
+	 * rs1[15:0] = old 16-bit word
+	 * rs2[15:0] = new 16-bit word
+	 *
+	 * No rd response. The caller uses checksum_finalize()
+	 * afterward to read the new checksum.
+	*/
+	ROCC_INSTRUCTION_SS(3, old_word, new_word, 9);
 }
 
 /*
@@ -397,16 +422,53 @@ int main(void)
 		return 10;
 
 	/*
-	 * Test 9:  checksum reset is independent of XOR accum.
+	 * Test 9:  RFC 1624 incremental checksum update.
 	 *
-	 * checksum_reset() must only clear checksumAccum.
+	 * Original words:
+	 *   0001 0002 0003 0004
 	 *
-	 * XOR accum still contains 0x77 from Test 6.
+	 * Original uncomplemented sum:
+	 *
+	 *   S = 000A
+	 *
+	 * Change:
+	 *
+	 *   old = 0002
+	 *   new = 0005
+	 * 
+	 * New full sum by inspection:
+	 *
+	 *   0001 + 0005 + 0003 + 0004
+	 * = 000D
+	 *
+	 * Expected new checksum:
+	 *
+	 *   ~000D = FFF2
+	 *
+	 * RFC 1624 equivalent:
+	 *
+	 *   C' = ~(~C + ~old + new)
 	*/
+	checksum_update(
+		0x0002,
+		0x0005
+	);
+
+	result = checksum_finalize();
+
+	if (result != 0xFFF2)
+		return 11;
+
+	/*
+	 * Test 10: verify the incremental update did not affect XOR accum.
+	 *
+	 * XOR accum should still contain 0x77 from the earlier XOR path.
+	*/
+
 	result = xorfold_read();
 
 	if (result != 0x77)
-		return 11;
+		return 12;
 
 	return 0;
 }
