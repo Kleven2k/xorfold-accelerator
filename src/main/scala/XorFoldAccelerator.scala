@@ -8,6 +8,7 @@ import org.chipsalliance.cde.config._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.rocket._
+import freechips.rocketchip.diplomacy.IdRange
 
 class XorFoldAccelerator(opcodes: OpcodeSet)(implicit p: Parameters) 
   extends LazyRoCC(opcodes) {
@@ -16,12 +17,28 @@ class XorFoldAccelerator(opcodes: OpcodeSet)(implicit p: Parameters)
     new XorFoldAcceleratorModuleImp(this)
 
   /* 
-   * Raw TileLink master used by funct=11.
+   * ------------------------------------------------------------
+   * Raw TileLink master
+   * ------------------------------------------------------------
    * 
-   * This first milestone intentionally uses only one source ID /
-   * one outstanding request.
+   * Used by:
    * 
-   * HasLazyRoCC automatically connects atlNode into the tile-local
+   *   funct=11:
+   *     one 64-bit Get
+   * 
+   *   funct=12:
+   *     N-word streaming Get with up to two outstanding requests
+   * 
+   * Source IDs:
+   *
+   *   0
+   *   1
+   * 
+   * funct=11 always uses source ID 0.
+   * 
+   * funct=12 may use source IDs 0 and 1 simultaneously.
+   * 
+   * HasLazyRoCC automatically connects altNode into the tile-local
    * TileLink master crossbar.
    */
   override val atlNode =
@@ -30,7 +47,8 @@ class XorFoldAccelerator(opcodes: OpcodeSet)(implicit p: Parameters)
         TLMasterPortParameters.v1(
           Seq(
             TLMasterParameters.v1(
-              "XorFoldTl"
+              name     = "XorFoldTl",
+              sourceId = IdRange(0, 2)
             )
           )
         )
@@ -51,18 +69,22 @@ class XorFoldAcceleratorModuleImp(
    *   - checksum streaming processes one 64-bit beat at a time
    *   - each beat contains four RFC 1071 16-bit words
    */
-  require(xLen == 64, "XorFoldAccelerator currently requires RV64")
+  require(
+    xLen == 64, 
+    "XorFoldAccelerator currently requires RV64"
+  )
 
   /*
-   * ------------------------------------------------------------
+   * ============================================================
    * Accumulators
-   * ------------------------------------------------------------
+   * ============================================================
    */
 
   /* 
    * XOR-fold accumulator.
    */
-  val accum = RegInit(0.U(xLen.W))
+  val accum = 
+    RegInit(0.U(xLen.W))
 
   /* 
    * RFC 1071 checksum accumulator.
@@ -75,24 +97,26 @@ class XorFoldAcceleratorModuleImp(
    * 
    * Bits [63:16] remains zero.
    * 
-   * This scalar representation makes RFC 1624 incremental updates
-   * direct and unambiguous.  
+   * The scalar representation also makes RFC 1624 incremental
+   * updates direct and unambiguous.  
    */
-  val checksumAccum = RegInit(0.U(xLen.W))
+  val checksumAccum = 
+    RegInit(0.U(xLen.W))
 
   /*
-   * ------------------------------------------------------------
+   * ============================================================
    * HellaCache memory-operation registers
-   * ------------------------------------------------------------
+   * ============================================================
    */
 
   /*
-   * Address of the next memory operation.
+   * Address of the next HellaCache memory operation.
    */ 
-  val ptr = RegInit(0.U(xLen.W))
+  val ptr = 
+    RegInit(0.U(xLen.W))
   
   /* 
-   * Number of HellaCache requests not yet issued.
+   * Number of HellaCache requests that have not yet been issued.
    */
   val remaining = 
     RegInit(0.U(xLen.W))
@@ -114,7 +138,6 @@ class XorFoldAcceleratorModuleImp(
    *   one write
    * 
    * funct=10:
-   *
    *   broadcast same value to n writes
    */
   val memWriteData = 
@@ -161,51 +184,119 @@ class XorFoldAcceleratorModuleImp(
     RegInit(sIdle)
 
   /* 
-   * ------------------------------------------------------------
-   * Raw TileLink registers / FSM
-   * ------------------------------------------------------------
-   * 
-   * This path is intentionally independent of the HellaCache FSM.
+   * ============================================================
+   * Single-request raw TileLink engine - funct=11
+   * ============================================================
    */
 
   /* 
    * Address captures from rs1 when funct=11 is accepted.
    * 
-   * It must remain stable from command acceptance until the 
-   * TileLink A-channel request is accepted.
+   * It remains stable from command acceptance until the TileLink
+   * A-channel request is accepted.
    */
   val tlAddr =
     RegInit(0.U(xLen.W))
 
   /* 
-   * Debug-only error flag for this first TileLink milestone.
+   * Shared debug-only TileLink error flag.
+   * 
+   * Used by funct=11 and funct=12.
    * 
    * Set when:
    *
-   *   - edge.Get reports that the requested transfer is illegal, or
-   *   - the D-channel response is denied/corrupt.
+   *   - edge.Get reports that a requested transfer is illegal
+   *   - a D-channel response is denied
+   *   - returned data is marked corrupt
    * 
-   * Software cannot read this flag yet. It is intended for waveform
-   * inspection during this milestone
+   * Software cannot read this flag yet. It is intended for
+    waveform/debug inspection.
    */
   val tlError =
     RegInit(false.B)
 
   /* 
+   * funct=11 FSM:
+   *
    * tlIdle:
-   *   no TileLink operation active
+   *   no single-request TL operation active
    * 
    * tlReq:
    *   generate/present one 64-bit Get
    * 
    * tlResp:
-   *
-   *   request accepted; wait for D-channel response
+   *   request accepted; wait for D response
    */
   val tlIdle :: tlReq :: tlResp :: Nil = Enum(3)
 
   val tlState =
     RegInit(tlIdle)
+
+  /* 
+   * ============================================================
+   * Two-outstanding TileLink streaming engine - funct=12
+   * ============================================================
+   *
+   * Unlike funct=11, this engine does not use a monolithic
+   * request/response FSM.
+   * 
+   * TileLink A and D channels may make progress independently
+   * during the same cycle.
+   */
+
+  /* 
+   * True while one funct=12 stream is active.
+   */
+  val tlStreamActive =
+    RegInit(false.B)
+
+  /* 
+   * Address of the next 64-bit word that has not yet been issued.
+   */
+  val tlStreamPtr =
+    RegInit(0.U(xLen.W))
+
+  /* 
+   * Number of words that have not yet been issued.
+   * 
+   * Important:
+   *
+   *   tlToIssue == 0
+   * 
+   * means every request has been launched.
+   * 
+   * It does NOT necessarily mean every response has returned.
+   */
+  val tlToIssue =
+    RegInit(0.U(xLen.W))
+
+  /* 
+   * Per-source outstanding state.
+   * 
+   * tlBusy(0):
+   *   source ID 0 currently has a Get in flight
+   * 
+   * tlBusy(1):
+   *   source ID 1 currently has a Get in flight
+   * 
+   * No address or ordering information is required after issue
+   * because XOR is associative and commutative.
+   */
+  val tlBusy =
+    RegInit(
+      VecInit(
+        Seq.fill(2)(false.B)
+      )
+    )
+
+  /* 
+   * Number of requests that have fired on the A channel but have
+   * not yet completed on D.
+   * 
+   * Maximum value is 2, so two bits are sufficient.
+   */
+  val tlInFlight =
+    RegInit(0.U(2.W))
 
   /* 
    * TileLink output port and negotiated edge.
@@ -214,9 +305,9 @@ class XorFoldAcceleratorModuleImp(
     outer.atlNode.out(0)
 
   /*
-   * ------------------------------------------------------------
+   * ============================================================
    * RoCC command queue / decode
-   * ------------------------------------------------------------
+   * ============================================================
    */
 
   val cmd = 
@@ -240,20 +331,24 @@ class XorFoldAcceleratorModuleImp(
   val doWriteResultN     = funct === 10.U
 
   /* 
-   * Raw TileLink equivalent of funct=3.
+   * Single-word raw TileLink equivalent of funct=3.
    */
   val doFoldMemTL        = funct === 11.U
 
   /* 
-   * ------------------------------------------------------------
+   * N-word raw TileLink stream with up to two outstanding Gets.
+   */
+  val doFoldMemTLN       = funct === 12.U
+
+  /* 
+   * ============================================================
    * Helper: start HellaCache memory operation
-   * ------------------------------------------------------------
+   * ============================================================
    *  
-   * Every operation that enters sMemReq should go through this
-   * helper so all persistent transaction state is initialized
+   * Every operation entering sMemReq goes through this helper so
+   * all persistent HellaCache transaction state is initialized
    * together.
    */
-
   def startMemOp(
       addr: UInt,
       count: UInt,
@@ -288,7 +383,6 @@ class XorFoldAcceleratorModuleImp(
    * 
    * The carry is then wrapped back into bit 0.  
    */
-
   def onesComplementAdd16(
       a: UInt, 
       b: UInt
@@ -408,10 +502,10 @@ class XorFoldAcceleratorModuleImp(
    * Global accelerator-idle definition
    * ------------------------------------------------------------
    * 
-   * For this first TileLink milestone, HellaCache and raw TileLink
+   * HellaCache, single-request TileLink, and streaming TileLink
    * operations are deliberately serialized.
    * 
-   * A new RoCC command can execute only when BOTH memory engines
+   * A new RoCC command can execute only when all three engines 
    * are idle.
    */
 
@@ -422,7 +516,7 @@ class XorFoldAcceleratorModuleImp(
     tlState === tlIdle
 
   val idle = 
-    memIdle && tlIdleNow
+    memIdle && tlIdleNow && !tlStreamActive
 
   /* 
    * xd means the instruction expects a response through io.resp.
@@ -470,7 +564,7 @@ class XorFoldAcceleratorModuleImp(
    *  
    * fold_mem(ptr)
    *  
-   * One-word XOR memory fold.
+   * Existing one-word HellaCache load.
    * ------------------------------------------------------------
    */
   when (cmd.fire && doFoldMem) {
@@ -491,8 +585,10 @@ class XorFoldAcceleratorModuleImp(
    *  
    * fold_mem_n(ptr, n)
    *  
-   * rs1 = starting pointer (address)
-   * rs2 = word count (number of xLen-sized words)
+   * Existing sequential HellaCache N-word load.
+   * 
+   * rs1 = starting address
+   * rs2 = number of 64-bit words
    *  
    * n == 0 is a no-op.
    * ------------------------------------------------------------
@@ -517,9 +613,7 @@ class XorFoldAcceleratorModuleImp(
    *  
    * write_result(dst_ptr)
    * 
-   * Single-word write.
-   *  
-   * This is now simply the n=1 version of write_result_n()
+   * Single-word HellaCache write.
    * ------------------------------------------------------------
    */
   when (cmd.fire && doWriteResult) {
@@ -555,11 +649,10 @@ class XorFoldAcceleratorModuleImp(
    * checksum_add_n(ptr, n)
    * 
    * rs1 = starting buffer address
-   * rs2 = number of 8-byte memory beats
-   * 
-   * This does not reset checksumAccum automatically.
+   * rs2 = number of 8-byte beats
    * 
    * n == 0 is a no-op.
+   * ------------------------------------------------------------
    */
   when (cmd.fire && doChecksumAddN) {
 
@@ -585,7 +678,6 @@ class XorFoldAcceleratorModuleImp(
    * No state-changing when-block is required.
    * 
    * The generic response path returns checksumFinal.
-   * checksumAccum itself is not modified.
    * ------------------------------------------------------------
    */
 
@@ -742,13 +834,63 @@ class XorFoldAcceleratorModuleImp(
       cmd.bits.rs1
 
     /* 
-     * Clear the debug error flag at the start of each new TL op.
+     * Clear the TL debug error flag for the new operation.
      */
     tlError :=
       false.B
 
     tlState :=
       tlReq
+  }
+
+  /* 
+   * ------------------------------------------------------------
+   * funct=12
+   * 
+   * fold_mem_tl_n(ptr, n)
+   * 
+   * rs1 = address of first 64-bit word
+   * rs2 = number of 64-bit words
+   * 
+   * At most two raw TileLink Gets may be outstanding 
+   * simultaneously.
+   * 
+   * Response ordering does not matter:
+   *
+   *   A ^ B ^ C == C ^ A ^ B
+   * 
+   * n == 0 is a no-op.
+   * ------------------------------------------------------------
+   */
+  when (cmd.fire && doFoldMemTLN) {
+
+    /* 
+     * Every new TileLink operation begins with a clean debug
+     * error state.
+     */
+    tlError :=
+      false.B 
+
+    when (cmd.bits.rs2 =/= 0.U) {
+      
+      tlStreamPtr :=
+        cmd.bits.rs1
+
+      tlToIssue :=
+        cmd.bits.rs2
+
+      tlBusy(0) :=
+        false.B 
+
+      tlBusy(1) :=
+        false.B 
+
+      tlInFlight :=
+        0.U 
+
+      tlStreamActive :=
+        true.B 
+    }
   }
 
   /*
@@ -999,11 +1141,15 @@ class XorFoldAcceleratorModuleImp(
 
   /* 
    * ============================================================
-   * Raw TileLink path - funct=11
+   * Raw TileLink request construction
    * ============================================================
    */
 
   /* 
+   * ------------------------------------------------------------
+   * funct=11 request
+   * ------------------------------------------------------------
+   * 
    * Generate one 8-byte Get using source ID 0.
    * 
    * edge.Get is combinational, so tlGetLegal is known before an
@@ -1017,24 +1163,116 @@ class XorFoldAcceleratorModuleImp(
     )
 
   /* 
-   * Present the request only if TileLink diplimacy reports that
-   * this manager/address/size combination legally supports Get.
+   * ------------------------------------------------------------
+   * funct=12 source allocator
+   * ------------------------------------------------------------
    * 
-   * An illegal transaction is therefore rejected locally; we do
-   * not knowingly assert A.valid for it.
+   * Fixed priority:
+   *
+   *   source 0 wins whenever both are free.
+   * 
+   * The two source IDs are functionally identical; this policy is
+   * simply deterministic and easy to reason about.
    */
-  tlOut.a.valid :=
-    (tlState === tlReq) && tlGetLegal 
-  
-  tlOut.a.bits :=
-    tlGet 
+  val tlSource0Free =
+    !tlBusy(0)
+
+  val tlSource1Free =
+    !tlBusy(1)
+
+  val tlHasFreeSource =
+    tlSource0Free || tlSource1Free
+
+  val tlIssueSource =
+    Mux(
+      tlSource0Free,
+      0.U,
+      1.U
+    )
 
   /* 
-   * IF the request is already known to be illegal, abort it before
-   * an A-channel transfer can occur.
+   * ------------------------------------------------------------
+   * Same-cycle D error visibility
+   * ------------------------------------------------------------
+   * 
+   * If a denied/corrupt D response is already visible this cycle,
+   * do not launch one more request before tlError is registered.
+   * 
+   * Because the engines are globally serialized, any D response
+   * while tlStreamActive belongs to funct=12.
    */
-  when (tlState === tlReq && !tlGetLegal) {
-    
+  val tlStreamDVisibleError =
+    tlStreamActive && 
+    tlOut.d.valid &&
+    (
+      tlOut.d.bits.denied || tlOut.d.bits.corrupt
+    )
+
+  /* 
+   * ------------------------------------------------------------
+   * funct=12 issue eligibility
+   * ------------------------------------------------------------
+   */
+  val tlStreamCanIssue =
+    tlStreamActive &&
+    !tlError &&
+    !tlStreamDVisibleError &&
+    (tlToIssue =/= 0.U) &&
+    tlHasFreeSource
+
+  /* 
+   * Candidate streaming Get.
+   * 
+   * edge.Get is combinational, so legality is known before the
+   * A-channel request is allowed to fire.
+   */
+  val (tlStreamGetLegal, tlStreamGet) =
+    tlEdge.Get(
+      fromSource = tlIssueSource,
+      toAddress  = tlStreamPtr,
+      lgSize     = log2Ceil(xLen / 8).U 
+    )
+
+  /* 
+   * ------------------------------------------------------------
+   * Shared TileLink A channel
+   * ------------------------------------------------------------
+   * 
+   * funct=11 and funct=12 share this physical A channel.
+   * 
+   * Global RoCC serialization guarantees they cannot be active
+   * simultaneously.
+   */
+  val singleTLValid =
+    (tlState === tlReq) &&
+    tlGetLegal
+
+  val streamTLValid =
+    tlStreamCanIssue &&
+    tlStreamGetLegal
+
+  tlOut.a.valid :=
+    singleTLValid || streamTLValid
+
+  tlOut.a.bits :=
+    Mux(
+      tlStreamActive,
+      tlStreamGet,
+      tlGet
+    )
+
+  /* 
+   * ------------------------------------------------------------
+   * Illegal funct=11 request
+   * ------------------------------------------------------------
+   * 
+   * Reject locally before A.valid can handshake.
+   */
+  when (
+    tlState === tlReq &&
+    !tlGetLegal
+  ) {
+
     tlError :=
       true.B 
 
@@ -1043,50 +1281,129 @@ class XorFoldAcceleratorModuleImp(
   }
 
   /* 
-   * Once the Get has actually been accepted, wait for exactly one
-   * D-channel response.
+   * ------------------------------------------------------------
+   * Illegal funct=12 request
+   * ------------------------------------------------------------
+   * 
+   * Once an illegal request is detected:
+   *
+   *   - do not issue it
+   *   - stop issuing future requests
+   *   - allow already-outstanding requests to drain
    */
-  when (tlOut.a.fire) {
+  val tlStreamIllegal =
+    tlStreamCanIssue &&
+    !tlStreamGetLegal
 
-    tlState :=
-      tlResp
+  when (tlStreamIllegal) {
+
+    tlError :=
+      true.B 
   }
 
   /* 
-   * Only accept a D response while this TL operation is waiting
-   * for one.
+   * ============================================================
+   * A-channel handshakes
+   * ============================================================
    */
-  tlOut.d.ready :=
-    tlState === tlResp 
+  val singleAFire =
+    tlOut.a.fire &&
+    (tlState === tlReq)
+
+  val streamAFire =
+    tlOut.a.fire &&
+    tlStreamActive
 
   /* 
-   * Single-beat 64-bit Get response.
-   * 
-   * The loaded data is treated as an opaque 64-bit value, exactly
-   * like funct=3. No network-order conversion is needed for XOR.
+   * ------------------------------------------------------------
+   * funct=11 A handshake
+   * ------------------------------------------------------------
    */
-  when (tlOut.d.fire) {
+  when (singleAFire) {
+
+    tlState :=
+      tlResp 
+  }
+
+  /* 
+   * ------------------------------------------------------------
+   * funct=12 A handshake
+   * ------------------------------------------------------------
+   */
+  when (streamAFire) {
 
     /* 
-     * Do not modify accum if TileLink reports a failed transfer.
-     * 
-     * denied:
-     *   manager rejected the access
-     * 
-     * corrupt:
-     * 
-     *   returned data is marked corrupt
+     * Mark selected source ID occupied.
      */
+    when (tlIssueSource === 0.U) {
 
-    when (
-      tlOut.d.bits.denied || tlOut.d.bits.corrupt
-    ) {
-      tlError :=
-        true.B
+      tlBusy(0) :=
+        true.B 
     } .otherwise {
 
+      tlBusy(1) :=
+        true.B 
+    }
+
+    /* 
+     * Advance to the next 64-bit word.
+     */
+    tlStreamPtr :=
+      tlStreamPtr + (xLen / 8).U 
+
+    /* 
+     * One fewer request remains to be issued.
+     */
+    tlToIssue :=
+      tlToIssue - 1.U 
+  }
+
+  /* 
+   * ============================================================
+   * Shared TileLink D channel
+   * ============================================================
+   *
+   * funct=11:
+   *   accept D only in tlResp
+   * 
+   * funct=12:
+   *   accept D for the full duration of tlStreamActive
+   */
+  tlOut.d.ready :=
+    (tlState === tlResp) || tlStreamActive
+
+  val singleDFire =
+    tlOut.d.fire && (tlState === tlResp)
+
+  val streamDFire = 
+    tlOut.d.fire && tlStreamActive
+
+  /* 
+   * ============================================================
+   * funct=11 response
+   * ============================================================
+   */
+  when (singleDFire) {
+
+    /* 
+     * Failed accesses leave accum untouched.
+     */
+    when (
+      tlOut.d.bits.denied ||
+      tlOut.d.bits.corrupt 
+    ) {
+
+      tlError :=
+        true.B 
+    } .otherwise {
+
+      /* 
+       * Plain XOR treats the loaded 64-bit word as opaque data.
+       * 
+       * No byte swapping is needed.
+       */
       accum :=
-        accum ^ tlOut.d.bits.data
+        accum ^ tlOut.d.bits.data 
     }
 
     tlState :=
@@ -1094,6 +1411,197 @@ class XorFoldAcceleratorModuleImp(
   }
 
   /* 
+   * ============================================================
+   * funct=12 response error
+   * ============================================================
+   */
+
+  val tlStreamResponseError =
+    streamDFire &&
+    (
+      tlOut.d.bits.denied ||
+      tlOut.d.bits.corrupt
+    )
+
+  /* 
+   * ============================================================
+   * funct=12 response processing
+   * ============================================================
+   */
+
+  when (streamDFire) {
+
+    when (tlStreamResponseError) {
+
+      /* 
+       * Stop future issue.
+       * 
+       * Requests already in flight are still drained.
+       */
+      tlError :=
+        true.B 
+    } .otherwise {
+
+      /* 
+       * Fold successful response immediately.
+       * 
+       * Return order does not matter:
+       *
+       *   A ^ B ^ C == C ^ A ^ B
+       */
+      accum := 
+        accum ^ tlOut.d.bits.data 
+    }
+
+    /* 
+     * Free whichever source ID generated this response.
+     */
+    when (tlOut.d.bits.source === 0.U) {
+
+      tlBusy(0) :=
+        false.B
+    } .otherwise {
+
+      tlBusy(1) :=
+        false.B 
+    }
+  }
+
+  /* 
+   * ============================================================
+   * funct=12 outstanding-request count
+   * ============================================================
+   *
+   * A and D may fire during the same cycle.
+   * 
+   * Cases:
+   * 
+   *   A=0 D=0 -> hold
+   *   A=1 D=0 -> +1
+   *   A=0 D=1 -> -1
+   *   A=1 D=1 -> hold
+   * 
+   * Chisel registers retain their previous value when no
+   * conditional assignment fires, so no explicit self-assignment
+   * is required for 00 or 11.
+   */
+
+  when (
+    streamAFire &&
+    !streamDFire
+  ) {
+
+    tlInFlight :=
+      tlInFlight + 1.U
+
+  } .elsewhen (
+    !streamAFire &&
+    streamDFire
+  ) {
+
+    tlInFlight :=
+      tlInFlight - 1.U 
+  }
+
+  /* 
+   * ============================================================
+   * funct=12 next-state bookkeeping
+   * ============================================================
+   *
+   * These combinational values describe what the issue and
+   * outstanding counts will mean after this cycle's handshakes.
+   */
+
+  val tlToIssueNext =
+    Mux(
+      streamAFire,
+      tlToIssue - 1.U,
+      tlToIssue
+    )
+
+  val tlInFlightNext =
+    Mux(
+      streamAFire && !streamDFire,
+
+      tlInFlight + 1.U,
+
+      Mux(
+        !streamAFire && streamDFire,
+
+        tlInFlight - 1.U,
+
+        tlInFlight
+      )
+    )
+
+  /* 
+   * Include both previously registered errors and errors first
+   * discovered during the current cycle.
+   */
+  val tlStreamErrorNext =
+    tlError ||
+    tlStreamIllegal ||
+    tlStreamResponseError
+
+  /* 
+   * ------------------------------------------------------------
+   * Normal completion
+   * ------------------------------------------------------------
+   * 
+   * Every request has been issued AND every response has returned.
+   */
+
+  val tlStreamNormalDone =
+    tlStreamActive &&
+    !tlStreamErrorNext &&
+    (tlToIssueNext === 0.U) &&
+    (tlInFlightNext === 0.U)
+
+  /* 
+   * ------------------------------------------------------------
+   * Abort completon
+   * ------------------------------------------------------------
+   * 
+   * Once an error occurs, remaining unissued words are abondoned.
+   * 
+   * Completion waits only for already-issued requests to drain.
+   */
+
+  val tlStreamAbortDone =
+    tlStreamActive &&
+    tlStreamErrorNext &&
+    (tlInFlightNext === 0.U)
+
+  /* 
+   * ------------------------------------------------------------
+   * End funct=12
+   * ------------------------------------------------------------
+   * 
+   * tlStreamActive clears on the clock edge containing final
+   * completion.
+   * 
+   * cmd.ready still sees the OLD tlStreamActive value during that
+   * cycle, so the next RoCC command cannot fire until the following
+   * cycle.
+   * 
+   * This deliberate one-cycle boundary prevents the final D
+   * response and a newly accepted command from both attempting to
+   * modify accum on the same edge.
+   */
+
+  when (
+    tlStreamNormalDone || tlStreamAbortDone
+  ) {
+
+    tlStreamActive :=
+      false.B 
+  }
+
+  /* 
+   * ------------------------------------------------------------
+   * Unused TileLink channels
+   * ------------------------------------------------------------
+   *
    * This client issues only ordinary Gets, so it does not use the
    * B, C, or E channels.
    * 
@@ -1118,7 +1626,8 @@ class XorFoldAcceleratorModuleImp(
   io.busy :=
     cmd.valid ||
     state =/= sIdle ||
-    tlState =/= tlIdle
+    tlState =/= tlIdle ||
+    tlStreamActive
 
   io.interrupt := 
     false.B 
