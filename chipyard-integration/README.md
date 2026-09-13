@@ -21,7 +21,9 @@ from a fresh chipyard checkout without needing a maintained chipyard fork.
     (single Rocket core + the accelerator) and `XorFoldRoCCBoomConfig` (same
     accelerator, single BOOM out-of-order core instead — verifies the RoCC interface
     isn't accidentally coupled to Rocket-specific timing; kept separate since BOOM
-    elaborates/simulates noticeably slower than Rocket)
+    elaborates/simulates noticeably slower than Rocket). Re-verified after funct=11/12
+    (raw TileLink, including the two-outstanding-request concurrency logic) were
+    added — all 30 checks in xorfold.c also pass unmodified on BOOM.
   - `tests/CMakeLists.txt` — adds the `xorfold` / `xorfold-dump` build targets
 - `xorfold.c` — the baremetal RoCC test (not part of the patch since it's a new file;
   copy it in directly). Exercises funct=0 (reset), funct=1 (fold), funct=2 (read), and
