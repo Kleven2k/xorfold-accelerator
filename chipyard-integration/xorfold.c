@@ -62,6 +62,31 @@ volatile unsigned long writeback_n[3] = {
 	0
 };
 
+/*
+ * funct=12 concurrency test buffer.
+ *
+ * Expected XOR:
+ *
+ *   0x11
+ * ^ 0x22
+ * ^ 0x44
+ * ^ 0x88
+ * ^ 0x110
+ * = 0x1EF
+ *
+ * Five words are intentional:
+ *
+ *   - source 0 and source 1 can both become occupied
+ *   - at least one source ID must later be freed and reused
+*/
+unsigned long data_tl_n[5] = {
+	0x11,
+	0x22,
+	0x44,
+	0x88,
+	0x110
+};
+
 /* 
  * ------------------------------------------------------------ 
  * XOR-fold operations 
@@ -152,6 +177,23 @@ static inline void xorfold_fold_mem_tl(unsigned long *ptr)
 	 * outstanding request.
 	*/
 	ROCC_INSTRUCTION_S(3, ptr, 11);
+}
+
+static inline void xorfold_fold_mem_tl_n(
+	unsigned long *ptr,
+	unsigned long n
+)
+{
+	/*
+	 * funct = 12
+	 * 
+	 * rs1 = starting address
+	 * rs2 = number of 64-bit words
+	 *
+	 * Raw TileLink N-word XOR fold with up to two
+	 * outstanding requests.
+	*/
+	ROCC_INSTRUCTION_SS(3, ptr, n, 12);
 }
 
 /*
@@ -762,6 +804,159 @@ int main(void)
 	 * program completion.
 	*/
 	data = 0x1000;
+
+	/*
+	 * ------------------------------------------------------------
+	 * Test 15: funct=12 two-outstanding TileLink N-word fold
+	 *
+	 * Compare the new raw-TileLink streaming path directly agains
+	 * the known-good funct=4 HellaCache path using the same five
+	 * 64-bit words.
+	 *
+	 * Buffer:
+	 *
+	 *   0x011
+	 *   0x022
+	 *   0x044
+	 *   0x088
+	 *   0x110
+	 *
+	 * Expected:
+	 *
+	 *   0x011
+	 * ^ 0x022
+	 * ^ 0x044
+	 * ^ 0x88
+	 * ^ 0x110
+	 * = 0x1EF
+	 *
+	 * n=5 is deliberate. With only two TileLink source IDs, five
+	 * requests require source IDs to be freed and reused during the
+	 * stream.
+	 * ------------------------------------------------------------
+	*/
+
+	/*
+	 * ------------------------------------------------------------
+	 * Reference: funct=4 HellaCache fold_mem_n
+	 * ------------------------------------------------------------
+	*/
+
+	xorfold_reset();
+
+	xorfold_fold_mem_n(
+		data_tl_n,
+		5
+	);
+
+	result = xorfold_read();
+
+	/*
+	 * First verify the known-good HellaCache path agains the
+	 * hand-computed result.
+	*/
+	if (result != 0x1EF)
+		return 25;
+
+	/*
+	 * ------------------------------------------------------------
+	 * Test: funct=12 raw TileLink fold_mem_tl_n
+	 * ------------------------------------------------------------
+	*/
+
+	xorfold_reset();
+
+	xorfold_fold_mem_tl_n(
+		data_tl_n,
+		5
+	);
+
+	/*
+	 * This read cannot execute until tilStreamActive has cleared.
+	 *
+	 * Normal funct=12 completion requires:
+	 *
+	 *   tlToIssue  == 0
+	 *   tlInFlight == 0
+	 *
+	 * Therefore reaching this read means all five requests have both
+	 * been issued and completed.
+	*/
+	result = xorfold_read();
+
+	if (result != 0x1EF)
+		return 26;
+
+	/*
+	 * ------------------------------------------------------------
+	 * Test 16: repeat funct=12 from a nonzero accumulator
+	 *
+	 * This verifies that funct=12 folds into the existing accumulator
+	 * rather than replacing it.
+	 *
+	 * Start with:
+	 *
+	 *   accum = 0x1000
+	 *
+	 * Then:
+	 *
+	 *   0x1000 ^ 0x1EF = 0x11EF
+	 * ------------------------------------------------------------
+	*/
+
+	xorfold_reset();
+
+	xorfold_fold(
+		0x1000,
+		0
+	);
+
+	result = xorfold_read();
+
+	if (result != 0x1000)
+		return 27;
+
+	xorfold_fold_mem_tl_n(
+		data_tl_n,
+		5
+	);
+
+	result = xorfold_read();
+
+	if (result != 0x11EF)
+		return 28;
+
+	/*
+	 * ------------------------------------------------------------
+	 * Test 17: funct=12 n=0 no-op
+	 *
+	 * The stream engine should not start at all.
+	 *
+	 * accum should remain unchanged.
+	 * ------------------------------------------------------------
+	*/
+
+	xorfold_reset();
+
+	xorfold_fold(
+		0x55AA,
+		0
+	);
+
+	result = xorfold_read();
+
+	if (result != 0x55AA)
+		return 29;
+
+	xorfold_fold_mem_tl_n(
+		data_tl_n,
+		0
+	);
+
+	result = xorfold_read();
+
+	if (result != 0x55AA)
+		return 30;
 
 	return 0;
 }
