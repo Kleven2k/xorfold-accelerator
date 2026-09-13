@@ -72,6 +72,47 @@ cd ../sims/verilator
 # exit code 0 == pass
 ```
 
+## Reproducing the funct=12 concurrency waveform
+
+The main README describes a waveform trace of `fold_mem_tl_n`'s two-outstanding
+TileLink engine (source-ID reuse, correct stall-when-both-busy, `accum` stepping
+through `0x11 → 0x33 → 0x77 → 0xff → 0x1ef`). That trace isn't checked into either
+repo — a VCD of the full SoC hierarchy for this test is several hundred MB, it's
+mechanically regenerable from source, and it would silently go stale the next time
+the accelerator changes. Regenerate it yourself instead:
+
+```bash
+source ~/projects/chipyard/env.sh
+cd ~/projects/chipyard/sims/verilator
+
+# Build a waveform-instrumented simulator (slower than the normal build; only
+# needed once per hardware change, not per run)
+make CONFIG=XorFoldRoCCConfig debug
+
+# Run the existing test with VCD tracing enabled. The +vcdfile plusarg must come
+# AFTER the binary path — before it, htif misparses it as a target option.
+./simulator-chipyard.harness-XorFoldRoCCConfig-debug \
+  ../../tests/build/xorfold.riscv +vcdfile=xorfold.vcd
+```
+
+This produces `xorfold.vcd` (full SoC hierarchy, hundreds of MB) covering the whole
+test, including two `fold_mem_tl_n(data_tl_n, 5)` calls. Open it in a waveform viewer
+(e.g. `gtkwave xorfold.vcd`) and look for these signals inside the accelerator's scope
+(under the tile/RoCC hierarchy — search the signal tree for `accum` if the exact path
+is hard to find):
+
+- `accum` — steps through the intermediate XOR values as each response arrives
+- `tlStreamActive`, `tlToIssue`, `tlInFlight` — the stream engine's own bookkeeping
+- `tlBusy_1`, `tlIssueSource` — which source ID is busy/selected (the compiler
+  optimized away a separate `tlBusy_0` signal since its value is always derivable
+  from `tlIssueSource`; see the commit history on `XorFoldAccelerator.scala` around
+  the funct=12 addition if you want the reasoning)
+- `streamAFire`, `streamDFire` — cycle-by-cycle A-channel issue and D-channel
+  completion events
+
+Delete the VCD when you're done with it — it's disposable simulation output, not
+something to keep around (hundreds of MB, and stale the moment the hardware changes).
+
 ## Updating xorfold.c after editing the test
 
 `chipyard/tests/xorfold.c` is the real, live test file — it's what actually gets
